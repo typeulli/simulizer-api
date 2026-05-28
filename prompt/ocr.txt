@@ -1,0 +1,4 @@
+Write the tex formula of the following image.
+You must write the image itself, without modification.
+For example, if the image has 'add', then you shouldn't write '+' instead.
+You must put text in form of $tex$ such as $y=x^2$ with only one line, not code block any else format.

@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Redirecting...</title>
+</head>
+<body>
+<script>
+  const popup = window.open(
+    "/console",
+    "console",
+    "width=400,height=700"
+  );
+
+  // 현재 창 닫기 시도
+  window.open('', '_self');
+  window.close();
+
+  // 실패 대비 fallback
+  document.body.innerHTML = `
+    <p>
+      팝업이 열리지 않았다면
+      <a href="/console" target="_blank">여기</a>를 클릭하세요.
+    </p>
+  `;
+</script>
+</body>
+</html>

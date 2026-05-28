@@ -1,0 +1,14 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -xc++
+    - -D__EMSCRIPTEN__
+    - -fno-exceptions
+    - -I../bin/include
+    - -I.
+  Compiler: clang++
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress:
+    - pp_file_not_found

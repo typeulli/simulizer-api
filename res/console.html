@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Simulizer · Console</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --font-sans: 'Pretendard Variable', 'Pretendard', -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Segoe UI', 'Noto Sans KR', sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+    --fs-10: 10px; --fs-11: 11px; --fs-12: 12px; --fs-13: 13px; --fs-14: 14px;
+    --fw-medium: 500; --fw-semibold: 600;
+    --lh-snug: 1.3; --lh-base: 1.5;
+    --tracking-tight: -0.015em;
+
+    --sp-1: 4px; --sp-1-5: 6px; --sp-2: 8px; --sp-2-5: 10px;
+    --sp-3: 12px; --sp-4: 16px;
+
+    --r-xs: 4px; --r-sm: 6px; --r-md: 8px; --r-full: 999px;
+
+    --motion-base: 180ms;
+    --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+    --t-base: var(--motion-base) var(--ease-out);
+
+    --bg:             #0a0c10;
+    --bg-subtle:      #0e1116;
+    --bg-canvas:      #0c0f14;
+    --surface:        #12161d;
+    --surface-hover:  #181d26;
+    --surface-sunken: #0a0c10;
+    --border:         #1f2630;
+    --border-strong:  #2a323e;
+    --border-subtle:  #171c24;
+    --fg:             #e6eaf0;
+    --fg-strong:      #ffffff;
+    --fg-muted:       #8b95a5;
+    --fg-subtle:      #5a6472;
+    --accent:         oklch(78% 0.14 200);
+    --success:        oklch(75% 0.15 160);
+    --danger:         oklch(70% 0.18 20);
+    --shadow-focus:   0 0 0 3px color-mix(in oklch, var(--accent) 30%, transparent);
+    --canvas-bg:      #0c0f14;
+  }
+
+  [data-theme="light"] {
+    --bg:             #ffffff;
+    --bg-subtle:      #f7f8fa;
+    --bg-canvas:      #fafbfc;
+    --surface:        #ffffff;
+    --surface-hover:  #f4f6f9;
+    --surface-sunken: #f7f8fa;
+    --border:         #e4e7ec;
+    --border-strong:  #d0d5dd;
+    --border-subtle:  #eff1f4;
+    --fg:             #0b0e14;
+    --fg-strong:      #000000;
+    --fg-muted:       #5b6471;
+    --fg-subtle:      #8a94a3;
+    --accent:         oklch(55% 0.14 220);
+    --success:        oklch(55% 0.14 160);
+    --danger:         oklch(60% 0.20 20);
+    --shadow-focus:   0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent);
+    --canvas-bg:      #fafbfc;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: var(--fs-13);
+    line-height: var(--lh-base);
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: background var(--t-base), color var(--t-base);
+  }
+
+  /* ===== Topbar ===== */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-2);
+    height: 40px;
+    padding: 0 var(--sp-3);
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
+  }
+  .brand-name {
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-13);
+    letter-spacing: var(--tracking-tight);
+    color: var(--fg);
+  }
+  .topbar-right { display: flex; align-items: center; gap: var(--sp-2); }
+
+  .status {
+    font-family: var(--font-mono);
+    font-size: var(--fs-11);
+    color: var(--fg-subtle);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 2px var(--sp-2-5);
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: var(--r-full);
+    transition: color var(--t-base), border-color var(--t-base);
+  }
+  .status::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: var(--r-full);
+    background: var(--fg-subtle);
+    transition: background var(--t-base), box-shadow var(--t-base);
+  }
+  .status[data-state="connected"] { color: var(--fg-muted); }
+  .status[data-state="connected"]::before {
+    background: var(--success);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--success) 25%, transparent);
+  }
+  .status[data-state="error"] { color: var(--danger); }
+  .status[data-state="error"]::before {
+    background: var(--danger);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--danger) 25%, transparent);
+  }
+
+  .icon-btn {
+    appearance: none;
+    background: transparent;
+    color: var(--fg-subtle);
+    border: 1px solid transparent;
+    border-radius: var(--r-sm);
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font: inherit;
+    transition: color var(--t-base), background var(--t-base);
+  }
+  .icon-btn:hover {
+    color: var(--fg);
+    background: var(--surface-hover);
+  }
+  .icon-btn:focus-visible {
+    outline: none;
+    box-shadow: var(--shadow-focus);
+  }
+  .icon-btn svg { width: 14px; height: 14px; }
+  #theme-toggle .icon-sun  { display: block; }
+  #theme-toggle .icon-moon { display: none; }
+  [data-theme="light"] #theme-toggle .icon-sun  { display: none; }
+  [data-theme="light"] #theme-toggle .icon-moon { display: block; }
+
+  /* ===== TabView ===== */
+  .tabs {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+    padding: var(--sp-2) var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    background: var(--bg);
+  }
+  .tab {
+    appearance: none;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--fg-muted);
+    font: inherit;
+    font-size: var(--fs-12);
+    padding: var(--sp-1-5) var(--sp-3);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1-5);
+    margin-bottom: -1px;
+    transition: color var(--t-base), border-color var(--t-base);
+  }
+  .tab[aria-selected="true"] {
+    color: var(--fg);
+    border-bottom-color: var(--accent);
+  }
+  .tab:hover:not([aria-selected="true"]) { color: var(--fg); }
+  .tab svg { width: 12px; height: 12px; }
+
+  .tab-panels {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .tab-panel {
+    flex: 1;
+    min-height: 0;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .tab-panel[data-active="true"] { display: flex; }
+
+  /* ===== Console panel ===== */
+  .section {
+    border-bottom: 1px solid var(--border-subtle);
+    padding: var(--sp-3) var(--sp-4);
+    flex-shrink: 0;
+    background: var(--bg);
+  }
+  .section:empty { display: none; }
+
+  #log {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--bg-canvas);
+    font-family: var(--font-mono);
+    font-size: var(--fs-12);
+  }
+
+  /* Progress rows (rendered inline into #log) */
+  .bar-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    margin: var(--sp-1) 0;
+    padding: 0 var(--sp-3);
+    font-family: var(--font-mono);
+    font-size: var(--fs-11);
+    color: var(--fg-muted);
+  }
+  .bar-row .bar-label { min-width: 60px; color: var(--fg-subtle); }
+  .bar-row .bar-value { min-width: 90px; text-align: right; }
+  .bar-row progress {
+    appearance: none;
+    -webkit-appearance: none;
+    border: none;
+    border-radius: var(--r-full);
+    background: var(--surface-sunken);
+    overflow: hidden;
+    flex: 1;
+    height: 6px;
+  }
+  .bar-row progress::-webkit-progress-bar {
+    background: var(--surface-sunken);
+    border-radius: var(--r-full);
+  }
+  .bar-row progress::-webkit-progress-value {
+    background: var(--accent);
+    border-radius: var(--r-full);
+    transition: width var(--t-base);
+  }
+  .bar-row progress::-moz-progress-bar {
+    background: var(--accent);
+    border-radius: var(--r-full);
+  }
+
+  /* Scrollbar */
+  #log::-webkit-scrollbar,
+  .scroll-body::-webkit-scrollbar { width: 10px; height: 10px; }
+  #log::-webkit-scrollbar-track,
+  .scroll-body::-webkit-scrollbar-track { background: transparent; }
+  #log::-webkit-scrollbar-thumb,
+  .scroll-body::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: var(--r-full);
+    border: 2px solid var(--bg-canvas);
+  }
+  #log::-webkit-scrollbar-thumb:hover,
+  .scroll-body::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+  /* ===== Output / Stats panels ===== */
+  .scroll-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--sp-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    background: var(--bg);
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    padding: var(--sp-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--sp-2);
+  }
+  .card-title {
+    font-size: var(--fs-10);
+    font-weight: var(--fw-semibold);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+  }
+  .card-sub {
+    font-family: var(--font-mono);
+    font-size: var(--fs-11);
+    color: var(--fg-subtle);
+  }
+
+  .big-number {
+    font-family: var(--font-mono);
+    font-size: 28px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--fg-strong);
+    line-height: 1.1;
+  }
+  .big-number.muted { color: var(--fg-subtle); }
+
+  .kv-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--sp-1) var(--sp-3);
+  }
+  .kv {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .kv-label {
+    font-size: var(--fs-10);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-subtle);
+    font-weight: var(--fw-semibold);
+  }
+  .kv-value {
+    font-family: var(--font-mono);
+    font-size: var(--fs-12);
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .metric {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1-5);
+  }
+  .metric + .metric {
+    margin-top: var(--sp-2);
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .metric-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: var(--fs-12);
+  }
+  .metric-name {
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: var(--fs-10);
+    font-weight: var(--fw-semibold);
+  }
+  .metric-value { color: var(--fg); font-weight: 500; }
+  .metric-value.na { color: var(--fg-subtle); }
+  .metric-bar {
+    height: 4px;
+    border-radius: var(--r-full);
+    background: var(--surface-sunken);
+    overflow: hidden;
+  }
+  .metric-bar > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    border-radius: var(--r-full);
+    transition: width var(--t-base);
+  }
+  .metric-bar.na > span { background: var(--fg-subtle); width: 0% !important; }
+  .metric-spark {
+    display: block;
+    width: 100%;
+    height: 32px;
+    background: var(--bg-canvas);
+    border-radius: var(--r-xs);
+  }
+
+  .stream-list {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 2px var(--sp-3);
+    font-family: var(--font-mono);
+    font-size: var(--fs-11);
+  }
+  .stream-list .lbl { color: var(--fg-muted); }
+  .stream-list .val { color: var(--fg); text-align: right; }
+</style>
+</head>
+<body>
+<script src="/scripts/console.js"></script>
+
+<header class="topbar">
+  <div class="brand">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="3"  y="3"  width="8" height="8" rx="1.5" fill="var(--accent)"/>
+      <rect x="13" y="3"  width="8" height="8" rx="1.5" fill="none" stroke="var(--fg-muted)" stroke-width="1.5"/>
+      <rect x="3"  y="13" width="8" height="8" rx="1.5" fill="none" stroke="var(--fg-muted)" stroke-width="1.5"/>
+      <rect x="13" y="13" width="8" height="8" rx="1.5" fill="var(--accent)" opacity="0.4"/>
+    </svg>
+    <span class="brand-name">Simulizer</span>
+  </div>
+  <div class="topbar-right">
+    <div id="status" class="status">연결 중...</div>
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle theme" title="Toggle theme">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+      </svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<div class="tabs" role="tablist">
+  <button class="tab" role="tab" data-tab="console" aria-selected="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+    </svg>
+    Console
+  </button>
+  <button class="tab" role="tab" data-tab="output" aria-selected="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/>
+    </svg>
+    Output
+  </button>
+  <button class="tab" role="tab" data-tab="stats" aria-selected="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-6"/>
+    </svg>
+    Stats
+  </button>
+</div>
+
+<div class="tab-panels">
+  <section class="tab-panel" data-panel="console" data-active="true" aria-label="Console">
+    <div id="log" aria-label="Log output"></div>
+  </section>
+
+  <section class="tab-panel" data-panel="output" aria-label="Output">
+    <div class="scroll-body">
+      <div class="card" id="card-result">
+        <div class="card-head">
+          <span class="card-title" id="result-label">Result</span>
+          <span class="card-sub" id="result-sub">return value</span>
+        </div>
+        <div class="big-number muted" id="result-value">—</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab-panel" data-panel="stats" aria-label="Stats">
+    <div class="scroll-body">
+      <div class="card" id="card-runtime">
+        <div class="card-head">
+          <span class="card-title">Runtime</span>
+          <span class="card-sub" id="runtime-status">idle</span>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span class="kv-label">Uptime</span>      <span class="kv-value" id="rt-uptime">—</span></div>
+          <div class="kv"><span class="kv-label">Last msg</span>    <span class="kv-value" id="rt-lastmsg">—</span></div>
+          <div class="kv"><span class="kv-label">Cores</span>       <span class="kv-value" id="rt-cores">—</span></div>
+          <div class="kv"><span class="kv-label">Platform</span>    <span class="kv-value" id="rt-platform">—</span></div>
+        </div>
+      </div>
+
+      <div class="card" id="card-resources">
+        <div class="card-head">
+          <span class="card-title">Resources</span>
+          <span class="card-sub">backend sampling</span>
+        </div>
+        <div class="metric" id="m-ram">
+          <div class="metric-head">
+            <span class="metric-name">RAM (RSS)</span>
+            <span class="metric-value na" id="m-ram-val">—</span>
+          </div>
+          <div class="metric-bar na"><span style="width: 0%"></span></div>
+          <canvas class="metric-spark" data-spark="ram"></canvas>
+        </div>
+        <div class="metric" id="m-cpu">
+          <div class="metric-head">
+            <span class="metric-name">CPU</span>
+            <span class="metric-value na" id="m-cpu-val">—</span>
+          </div>
+          <div class="metric-bar na"><span style="width: 0%"></span></div>
+          <canvas class="metric-spark" data-spark="cpu"></canvas>
+        </div>
+        <div class="metric" id="m-gpu">
+          <div class="metric-head">
+            <span class="metric-name">GPU</span>
+            <span class="metric-value na" id="m-gpu-val">N/A</span>
+          </div>
+          <div class="metric-bar na"><span style="width: 0%"></span></div>
+          <canvas class="metric-spark" data-spark="gpu"></canvas>
+        </div>
+      </div>
+
+      <div class="card" id="card-alloc">
+        <div class="card-head">
+          <span class="card-title">Allocations</span>
+          <span class="card-sub">Tensor buffers</span>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span class="kv-label">Live</span>         <span class="kv-value" id="al-live">0</span></div>
+          <div class="kv"><span class="kv-label">Live bytes</span>   <span class="kv-value" id="al-live-b">0 B</span></div>
+          <div class="kv"><span class="kv-label">Total allocs</span> <span class="kv-value" id="al-total">0</span></div>
+          <div class="kv"><span class="kv-label">Total bytes</span>  <span class="kv-value" id="al-total-b">0 B</span></div>
+        </div>
+      </div>
+
+      <div class="card" id="card-stream">
+        <div class="card-head">
+          <span class="card-title">Stream</span>
+          <span class="card-sub" id="stream-rate">0.0 msg/s</span>
+        </div>
+        <div class="kv-grid" style="margin-bottom: var(--sp-1)">
+          <div class="kv"><span class="kv-label">Total</span>    <span class="kv-value" id="st-total">0</span></div>
+          <div class="kv"><span class="kv-label">Bytes</span>    <span class="kv-value" id="st-bytes">0 B</span></div>
+        </div>
+        <div class="stream-list" id="st-breakdown"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+  // Theme toggle
+  const THEME_KEY = 'simulizer.theme';
+  const root = document.documentElement;
+  const savedTheme = localStorage.getItem(THEME_KEY);
+  if (savedTheme === 'light' || savedTheme === 'dark') {
+    root.setAttribute('data-theme', savedTheme);
+  }
+  const toggleBtn = document.getElementById('theme-toggle');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', () => {
+      const next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+      if (next === 'dark') root.removeAttribute('data-theme');
+      else root.setAttribute('data-theme', next);
+      localStorage.setItem(THEME_KEY, next);
+    });
+  }
+
+  // Tab switching
+  const tabButtons = document.querySelectorAll('.tab[data-tab]');
+  const tabPanels  = document.querySelectorAll('.tab-panel[data-panel]');
+  tabButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.tab;
+      tabButtons.forEach(b => b.setAttribute('aria-selected', b === btn ? 'true' : 'false'));
+      tabPanels.forEach(p => p.setAttribute('data-active', p.dataset.panel === target ? 'true' : 'false'));
+    });
+  });
+
+  const status = document.getElementById("status");
+  let con;
+  try {
+    con = SimulizerConsole.mount("#log");
+  } catch (e) {
+    console.error('SimulizerConsole mount failed:', e);
+    con = { addLog: () => {}, addMatShow: () => {}, addSeries: () => {}, graphToHolder: () => {} };
+  }
+
+  function themeColors() {
+    const styles = getComputedStyle(root);
+    return {
+      canvasBg:   styles.getPropertyValue('--canvas-bg').trim() || '#0c0f14',
+      accentLine: styles.getPropertyValue('--accent').trim()    || 'oklch(78% 0.14 200)',
+    };
+  }
+
+  function renderSparkline(data) {
+    const { canvasBg, accentLine } = themeColors();
+    const W = 280, H = 48;
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = canvasBg;
+    ctx.fillRect(0, 0, W, H);
+    if (data.length < 2) return c.toDataURL();
+    let lo = data[0], hi = data[0];
+    for (const v of data) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    const range = hi - lo || 1;
+    ctx.strokeStyle = accentLine;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+      const x = i / (data.length - 1) * W;
+      const y = H - 4 - ((data[i] - lo) / range) * (H - 8);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    return c.toDataURL();
+  }
+
+  function renderHeatmap(rows, cols, data) {
+    const scale = Math.max(4, Math.min(32, Math.floor(300 / Math.max(rows, cols))));
+    const c = document.createElement('canvas');
+    c.width = cols * scale; c.height = rows * scale;
+    const ctx = c.getContext('2d');
+    // Fixed [0,1] grayscale to match the web visualization
+    // (frontend/src/utils/wasm/tensor.ts: mat_data_to_image_url). Per-frame
+    // min/max normalization was hiding diffusion dynamics because, for any
+    // localized initial blob, the peak stays at the same cell and gets
+    // re-normalized to 1 every frame.
+    for (let r = 0; r < rows; r++) {
+      for (let k = 0; k < cols; k++) {
+        const v = Math.max(0, Math.min(1, data[r * cols + k]));
+        const gray = Math.round(v * 255);
+        ctx.fillStyle = `rgb(${gray},${gray},${gray})`;
+        ctx.fillRect(k * scale, r * scale, scale, scale);
+      }
+    }
+    return c.toDataURL();
+  }
+
+  const logEl = document.getElementById('log');
+  const barEntries = {};
+  function ensureBar(id, min, max) {
+    if (barEntries[id]) return barEntries[id];
+    const placeholder = logEl.querySelector('[data-placeholder]');
+    if (placeholder) logEl.removeChild(placeholder);
+    const wrap = document.createElement('div');
+    wrap.className = 'bar-row';
+    wrap.innerHTML =
+        '<span class="bar-label">bar ' + id + '</span>'
+      + '<progress value="0" max="' + (max - min) + '"></progress>'
+      + '<span class="bar-value">' + min + ' / ' + max + '</span>';
+    logEl.appendChild(wrap);
+    logEl.scrollTop = logEl.scrollHeight;
+    barEntries[id] = {
+      min, max,
+      progress: wrap.querySelector('progress'),
+      text: wrap.querySelector('.bar-value'),
+    };
+    return barEntries[id];
+  }
+  function setBarValue(id, val) {
+    const b = barEntries[id];
+    if (!b) return;
+    b.progress.value = val - b.min;
+    b.text.textContent = val + ' / ' + b.max;
+  }
+
+  // ===== Stats state =====
+  const SPARK_LEN = 60;
+  const msgCounts = {};
+  let msgTotal = 0;
+  let msgBytes = 0;
+  let lastMsgAt = 0;
+  let connectedAt = 0;
+  const rateWindow = [];
+  const sparkData = { ram: [], cpu: [], gpu: [] };
+  let ramPeak = 0;
+
+  document.getElementById('rt-cores').textContent =
+    (navigator.hardwareConcurrency || '—').toString();
+  document.getElementById('rt-platform').textContent =
+    (navigator.platform || '—').replace(/\s*[\(\[].*$/, '').slice(0, 18);
+
+  function fmtBytes(n) {
+    if (n == null || isNaN(n)) return '—';
+    if (n < 1024) return n + ' B';
+    const u = ['KB','MB','GB','TB'];
+    let v = n / 1024, i = 0;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v < 10 ? 2 : 1) + ' ' + u[i];
+  }
+  function fmtDuration(ms) {
+    if (ms == null || ms < 0) return '—';
+    const s = ms / 1000;
+    if (s < 60)     return s.toFixed(1) + 's';
+    const m = Math.floor(s / 60);
+    const rs = Math.floor(s - m * 60);
+    if (m < 60)     return m + ':' + String(rs).padStart(2, '0');
+    const h = Math.floor(m / 60);
+    const rm = m - h * 60;
+    return h + ':' + String(rm).padStart(2, '0') + ':' + String(rs).padStart(2, '0');
+  }
+  function fmtPct(p) {
+    if (p == null || p < 0) return 'N/A';
+    return p.toFixed(1) + '%';
+  }
+
+  function pushSpark(key, v) {
+    const a = sparkData[key];
+    a.push(v);
+    if (a.length > SPARK_LEN) a.shift();
+  }
+
+  function drawMetricSpark(canvas, data, hiHint) {
+    const { canvasBg, accentLine } = themeColors();
+    const cssW = canvas.clientWidth || 280;
+    const cssH = canvas.clientHeight || 32;
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = canvasBg;
+    ctx.fillRect(0, 0, cssW, cssH);
+    if (data.length < 2) return;
+    let lo = data[0], hi = data[0];
+    for (const v of data) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hiHint != null && hiHint > hi) hi = hiHint;
+    const range = hi - lo || 1;
+    ctx.strokeStyle = accentLine;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+      const x = i / (SPARK_LEN - 1) * cssW;
+      const y = cssH - 2 - ((data[i] - lo) / range) * (cssH - 4);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  function setMetric(key, value, displayText, maxForBar) {
+    const el  = document.getElementById('m-' + key);
+    const val = document.getElementById('m-' + key + '-val');
+    const bar = el.querySelector('.metric-bar');
+    const fill = bar.querySelector('span');
+    if (value == null || value < 0) {
+      val.textContent = displayText || 'N/A';
+      val.classList.add('na');
+      bar.classList.add('na');
+      fill.style.width = '0%';
+    } else {
+      val.textContent = displayText;
+      val.classList.remove('na');
+      bar.classList.remove('na');
+      const pct = Math.max(0, Math.min(100, (value / maxForBar) * 100));
+      fill.style.width = pct.toFixed(1) + '%';
+    }
+  }
+
+  function renderStreamBreakdown() {
+    const order = ['log','array','matrix','graph','bar','series','stat','result','other'];
+    const used  = order.filter(k => msgCounts[k]);
+    const box = document.getElementById('st-breakdown');
+    box.innerHTML = used.map(k =>
+      '<span class="lbl">' + k + '</span><span class="val">' + msgCounts[k] + '</span>'
+    ).join('');
+  }
+
+  function applyStat(s) {
+    pushSpark('ram', s.rss_bytes);
+    pushSpark('cpu', s.cpu_pct);
+    pushSpark('gpu', s.gpu_pct);
+    if (s.rss_bytes > ramPeak) ramPeak = s.rss_bytes;
+
+    document.getElementById('al-live').textContent     = s.buffers.toLocaleString();
+    document.getElementById('al-live-b').textContent   = fmtBytes(s.buffer_bytes);
+    document.getElementById('al-total').textContent    = s.total_alloc.toLocaleString();
+    document.getElementById('al-total-b').textContent  = fmtBytes(s.total_alloc_bytes);
+
+    setMetric('ram', s.rss_bytes, fmtBytes(s.rss_bytes), Math.max(ramPeak * 1.2, 64 * 1024 * 1024));
+    setMetric('cpu', s.cpu_pct, fmtPct(s.cpu_pct), 100);
+    setMetric('gpu', s.gpu_pct, fmtPct(s.gpu_pct), 100);
+  }
+
+  function applyResult(r) {
+    const v = document.getElementById('result-value');
+    const lbl = document.getElementById('result-label');
+    const sub = document.getElementById('result-sub');
+    v.textContent = r.value;
+    v.classList.remove('muted');
+    lbl.textContent = (r.label || 'Result').toUpperCase();
+    sub.textContent = 'updated ' + new Date().toLocaleTimeString();
+  }
+
+  function noteMessage(type, raw) {
+    msgTotal++;
+    msgBytes += (raw && raw.length) | 0;
+    const k = type || 'other';
+    msgCounts[k] = (msgCounts[k] || 0) + 1;
+    lastMsgAt = performance.now();
+    const now = lastMsgAt;
+    rateWindow.push(now);
+    while (rateWindow.length && (now - rateWindow[0]) > 5000) rateWindow.shift();
+  }
+
+  function tick() {
+    const now = performance.now();
+    const uptime = connectedAt ? (now - connectedAt) : 0;
+    document.getElementById('rt-uptime').textContent = connectedAt ? fmtDuration(uptime) : '—';
+    document.getElementById('rt-lastmsg').textContent =
+      lastMsgAt ? fmtDuration(now - lastMsgAt) + ' ago' : '—';
+
+    const idleMs = lastMsgAt ? (now - lastMsgAt) : Infinity;
+    document.getElementById('runtime-status').textContent =
+      !connectedAt ? 'disconnected'
+      : idleMs < 1000 ? 'active'
+      : idleMs < 5000 ? 'streaming'
+      : 'idle';
+
+    const rate = rateWindow.length > 1
+      ? (rateWindow.length / ((rateWindow[rateWindow.length - 1] - rateWindow[0]) / 1000 || 1))
+      : 0;
+    document.getElementById('stream-rate').textContent = rate.toFixed(1) + ' msg/s';
+    document.getElementById('st-total').textContent    = msgTotal.toLocaleString();
+    document.getElementById('st-bytes').textContent    = fmtBytes(msgBytes);
+    renderStreamBreakdown();
+
+    document.querySelectorAll('canvas.metric-spark').forEach(c => {
+      const k = c.dataset.spark;
+      const hint = (k === 'cpu' || k === 'gpu') ? 100 : null;
+      drawMetricSpark(c, sparkData[k], hint);
+    });
+  }
+
+  function dispatch(msg, raw) {
+    noteMessage(msg.type, raw);
+    if (msg.type === 'log') {
+      if (msg.holder !== undefined) {
+        con.logToHolder(msg.holder, msg.kind || 'info', msg.text);
+      } else {
+        con.addLog(msg.kind || 'info', msg.text);
+      }
+    } else if (msg.type === 'array') {
+      con.addLog('info', msg.label);
+      con.addMatShow(1, msg.data.length, renderSparkline(msg.data));
+    } else if (msg.type === 'matrix') {
+      const img = renderHeatmap(msg.rows, msg.cols, msg.data);
+      if (msg.holder !== undefined) {
+        con.visualToHolder(msg.holder, img, msg.rows, msg.cols);
+      } else {
+        con.addMatShow(msg.rows, msg.cols, img);
+      }
+    } else if (msg.type === 'series') {
+      con.addSeries(msg.id);
+    } else if (msg.type === 'graph') {
+      const fixedMin = msg.min !== undefined ? msg.min : undefined;
+      const fixedMax = msg.max !== undefined ? msg.max : undefined;
+      if (msg.holder !== undefined) {
+        con.graphToHolder(msg.holder, msg.data, fixedMin, fixedMax);
+      } else {
+        con.graphToHolder(0, msg.data, fixedMin, fixedMax);
+      }
+    } else if (msg.type === 'bar') {
+      const key = String(msg.id);
+      const mn = msg.min !== undefined ? msg.min : (barEntries[key] ? barEntries[key].min : 0);
+      const mx = msg.max !== undefined ? msg.max : (barEntries[key] ? barEntries[key].max : 1);
+      ensureBar(key, mn, mx);
+      setBarValue(key, msg.value);
+    } else if (msg.type === 'stat') {
+      applyStat(msg);
+    } else if (msg.type === 'result') {
+      applyResult(msg);
+    }
+  }
+
+  setInterval(tick, 250);
+
+  const es = new EventSource("/events");
+  es.onopen  = () => {
+    status.textContent = "연결됨";
+    status.dataset.state = "connected";
+    connectedAt = performance.now();
+  };
+  es.onerror = () => {
+    status.textContent = "연결 끊김 — 재연결 중...";
+    status.dataset.state = "error";
+  };
+  es.onmessage = (e) => {
+    try { dispatch(JSON.parse(e.data), e.data); }
+    catch { noteMessage('other', e.data); con.addLog("info", e.data); }
+  };
+</script>
+</body>
+</html>

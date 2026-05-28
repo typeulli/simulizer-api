@@ -1,0 +1,8 @@
+temp/*
+**/bin/*
+key/*
+*/*.key
+.*/*
+**/__pycache__/*
+lsp_root/sessions/*
+res/JetBrainsMono-Medium.ttf
