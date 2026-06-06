@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import re
 import shutil
@@ -12,6 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from block2cpp import cppize
+from debug.instrument import instrument_tu
 
 
 router = APIRouter(prefix="/compile")
@@ -19,9 +22,18 @@ router = APIRouter(prefix="/compile")
 path_here = Path(__file__).parent.parent
 path_temp = path_here / "temp"
 path_bin = path_here / "bin"
+path_res = path_here / "res"
 
 
 ALLOWED_BUNDLE_EXTENSIONS = (".cpp", ".hpp")
+# Image files usable as the exe icon. .ico is used as-is; the rest are converted
+# to .ico server-side (Pillow). Kept in sync with the frontend BINARY_EXTENSIONS.
+_IMAGE_EXTENSIONS = (".ico", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+# Files that ride along in the bundle tree (so the server can read the project
+# config and assets) but are NOT translation units — skipped when materializing
+# the compile sandbox. config.json is parsed for compile options; image files
+# are resolved as the exe icon.
+_NONSOURCE_SKIP_EXTENSIONS = (".json",) + _IMAGE_EXTENSIONS
 
 
 # ── Compile options (from the project's compile.json, sent by the frontend) ──
@@ -36,11 +48,15 @@ _STDS = {"c++17", "c++20", "c++23"}
 _DEFINE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[A-Za-z0-9_.]+)?$')
 
 
+# Internal holder for the resolved compile options. No longer a request field:
+# the server parses these from the bundle's config.json (single source of truth)
+# rather than trusting client-sent values.
 class CompileOptions(BaseModel):
     system: Optional[str] = None       # auto/None → sniff User-Agent (Build only)
     optimization: str = "O3"
     std: str = "c++17"
     defines: list[str] = []
+    icon: str = ""                     # relative .ico path (compile.icon); Build+Windows only
 
 
 @dataclass(frozen=True)
@@ -61,6 +77,64 @@ def _resolve_flags(opts: CompileOptions) -> ResolvedFlags:
             raise HTTPException(status_code=400, detail=f"Invalid define: {d!r}")
         define_flags.append(f"-D{d}")
     return ResolvedFlags(std_flag=f"-std={opts.std}", opt_flag=f"-{opts.optimization}", define_flags=define_flags)
+
+
+# ── config.json (server-side parse) ────────────────────────────────────────
+#
+# The frontend ships config.json inside the bundle tree as a normal file; the
+# server is the source of truth for what reaches the compiler. Settings are
+# namespaced into sections: `build` (system + icon, Build-only) and `compile`
+# (optimization/std/defines). Missing/invalid values fall back to defaults (the
+# editor surfaces JSON errors to the user separately). _resolve_flags then
+# re-validates as defense in depth before anything hits a command line.
+_SYSTEMS = {"auto", "windows", "linux", "macos"}
+CONFIG_FILENAME = "config.json"
+
+
+def _read_config(tree: Optional[list]) -> dict:
+    """Parse the bundle's root config.json and return the whole object, or {}
+    when it's absent / unparseable / wrong-shaped (lenient — a broken config
+    falls back to defaults rather than failing the build)."""
+    if not isinstance(tree, list):
+        return {}
+    node = next(
+        (n for n in tree
+         if isinstance(n, dict) and n.get("type") == "file" and n.get("name") == CONFIG_FILENAME),
+        None,
+    )
+    if node is None:
+        return {}
+    try:
+        data = json.loads(node.get("content") or "")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _section(cfg: dict, name: str) -> dict:
+    sec = cfg.get(name)
+    return sec if isinstance(sec, dict) else {}
+
+
+def _compile_options_from_tree(tree: Optional[list]) -> CompileOptions:
+    """Resolve compile options from the bundle's config.json — `system`/`icon`
+    from the `build` section, optimization/std/defines from `compile`. Unknown/
+    out-of-range values silently fall back to their defaults."""
+    cfg = _read_config(tree)
+    build = _section(cfg, "build")
+    comp = _section(cfg, "compile")
+    opts = CompileOptions()
+    if isinstance(build.get("system"), str) and build["system"] in _SYSTEMS:
+        opts.system = build["system"]
+    if isinstance(build.get("icon"), str):
+        opts.icon = build["icon"].strip()
+    if isinstance(comp.get("optimization"), str) and comp["optimization"] in _OPT_LEVELS:
+        opts.optimization = comp["optimization"]
+    if isinstance(comp.get("std"), str) and comp["std"] in _STDS:
+        opts.std = comp["std"]
+    if isinstance(comp.get("defines"), list):
+        opts.defines = [d for d in comp["defines"] if isinstance(d, str) and _DEFINE_RE.match(d)]
+    return opts
 
 
 # Headers the build needs to see when compiling user code. We stage them into
@@ -102,6 +176,7 @@ def _stage_build_system(system_dir: Path):
 # are dropped (simstd.hpp gates those behind `_WIN32`) and the portable
 # embedded-asset data is recompiled from source inside the container.
 WINDOWS_GXX = "C:/mingw64/bin/g++.exe"
+WINDOWS_WINDRES = "C:/mingw64/bin/windres.exe"
 LINUX_BUILD_IMAGE = "gcc:13"
 # Apple's SDK can't ship in a public image, so this points at a locally-built
 # osxcross image; `o64-clang++` is its C++ driver. Build the image separately
@@ -168,12 +243,16 @@ def _stage_build_data(data_dir: Path) -> Path:
 
 def _build_argv(os_key: str, *, cpp_file: Path, exe_file: Path, system_dir: Path,
                 project_root: Path, out_dir: Path, data_cpp: Optional[Path],
-                flags: ResolvedFlags) -> list[str]:
+                flags: ResolvedFlags, res_override: Optional[Path] = None) -> list[str]:
     """Assemble the compiler command line for the given target OS. Windows runs
     natively; Linux/macOS wrap g++/clang in `docker run`, mounting out_dir at
-    /work so every path the compiler touches lives under the bind mount."""
+    /work so every path the compiler touches lives under the bind mount.
+
+    `res_override` is a per-build resource object (font + custom icon) used in
+    place of the prebuilt bin/resource.o when the user set an exe icon; it only
+    applies to Windows (other targets don't embed a Win32 resource)."""
     if os_key == "windows":
-        res_file = path_bin / "resource.o"
+        res_file = res_override if res_override is not None else (path_bin / "resource.o")
         bin_file = path_bin / "binary_data.o"
         return [
             WINDOWS_GXX,
@@ -221,6 +300,138 @@ def _build_argv(os_key: str, *, cpp_file: Path, exe_file: Path, system_dir: Path
         image,
         *inner,
     ]
+
+
+# ── Windows exe icon ───────────────────────────────────────────────────────
+#
+# The bundle ships the chosen icon image (base64) as a normal tree file. The
+# server resolves the relative compile.icon path, converts the image to a
+# Windows .ico when it isn't one already (Pillow), and embeds it into a
+# per-build resource object alongside the runtime font — then links that instead
+# of the prebuilt bin/resource.o. Windows-only (other targets carry no resource).
+_MAX_ICON_BYTES = 1 * 1024 * 1024          # .ico passthrough cap (1 MB)
+_MAX_ICON_SOURCE_BYTES = 4 * 1024 * 1024   # source image cap, pre-conversion (4 MB)
+
+
+def _decode_b64(data: str, cap: int) -> bytes:
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="아이콘 이미지를 디코딩할 수 없어요 (base64 형식 오류).")
+    if len(raw) > cap:
+        raise HTTPException(status_code=400, detail="아이콘 이미지가 너무 큽니다.")
+    return raw
+
+
+def _image_to_ico(raw: bytes) -> bytes:
+    """Convert a raster image (PNG/JPG/GIF/BMP/WebP/…) to a multi-size Windows
+    .ico via Pillow. Non-square inputs are padded to a transparent square so
+    they aren't distorted. Pillow is imported lazily so a missing optional
+    dependency only affects icon conversion, not regular builds."""
+    try:
+        from PIL import Image
+    except ImportError:
+        raise HTTPException(status_code=500, detail="이미지를 .ico 로 변환하려면 Pillow(PIL) 가 필요해요.")
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        img = img.convert("RGBA")
+    except Exception:
+        raise HTTPException(status_code=400, detail="이미지 파일을 읽을 수 없어요.")
+    w, h = img.size
+    side = max(w, h)
+    if w != h:  # pad to a transparent square so non-square art isn't stretched
+        square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        square.paste(img, ((side - w) // 2, (side - h) // 2))
+        img = square
+    if side != 256:
+        img = img.resize((256, 256), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="ICO", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+    return buf.getvalue()
+
+
+def _icon_to_ico_bytes(content_b64: str, ext: str) -> bytes:
+    """Resolve a bundle image file (base64) to Windows .ico bytes. A .ico is
+    validated and passed through; any other supported raster image is
+    converted. Raises HTTPException(400/500) on bad/unreadable input."""
+    if ext == ".ico":
+        raw = _decode_b64(content_b64, _MAX_ICON_BYTES)
+        # ICONDIR header: reserved(2)=0, type(2)=1 (icon), little-endian.
+        if raw[:4] != b"\x00\x00\x01\x00":
+            raise HTTPException(status_code=400, detail="유효한 .ico 파일이 아니에요.")
+        return raw
+    return _image_to_ico(_decode_b64(content_b64, _MAX_ICON_SOURCE_BYTES))
+
+
+def _resolve_icon_from_tree(tree: Optional[list], icon_path: str) -> Optional[bytes]:
+    """Resolve the relative `compile.icon` path within the bundle tree to
+    Windows .ico bytes, server-side (converting non-.ico images on the fly).
+    Returns None when unset / not a supported image / not found / not base64.
+
+    Traversal-safe: the path is walked against the in-memory tree (it can never
+    reach the filesystem), and absolute / drive-letter / '.' / '..' segments are
+    rejected outright. A found-but-unreadable image raises."""
+    if not icon_path or not isinstance(tree, list):
+        return None
+    p = icon_path.strip().replace("\\", "/")
+    ext = Path(p).suffix.lower()
+    if ext not in _IMAGE_EXTENSIONS:
+        return None
+    if p.startswith("/") or (len(p) >= 2 and p[1] == ":"):  # absolute / drive-letter
+        return None
+    parts = [seg for seg in p.split("/") if seg != ""]
+    if not parts or any(seg in (".", "..") for seg in parts):
+        return None
+    nodes: object = tree
+    for i, seg in enumerate(parts):
+        if not isinstance(nodes, list):
+            return None
+        match = next((n for n in nodes if isinstance(n, dict) and n.get("name") == seg), None)
+        if match is None:
+            return None
+        if i == len(parts) - 1:
+            if match.get("type") != "file" or match.get("encoding") != "base64":
+                return None
+            return _icon_to_ico_bytes(match.get("content") or "", ext)
+        if match.get("type") != "folder":
+            return None
+        nodes = match.get("contents", [])
+    return None
+
+
+def _build_windows_resource(out_dir: Path, icon_bytes: bytes) -> Path:
+    """Compile a per-build resource object that embeds BOTH the runtime font
+    (RCDATA 101 — simstd.hpp loads it via FindResource) and the user's icon
+    (ICON 1 — picked up by Explorer for the .exe). Returns the .o path.
+
+    windres runs with cwd=res_dir so the relative resource filenames resolve.
+    """
+    res_dir = out_dir / "_res"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "app.ico").write_bytes(icon_bytes)
+
+    rc_lines: list[str] = []
+    font_src = path_res / "JetBrainsMono-Medium.ttf"
+    if font_src.is_file():
+        shutil.copy2(font_src, res_dir / "JetBrainsMono-Medium.ttf")
+        rc_lines.append('101 RCDATA "JetBrainsMono-Medium.ttf"')
+    rc_lines.append('1 ICON "app.ico"')
+    (res_dir / "simulizer.rc").write_text("\n".join(rc_lines) + "\n", encoding="utf-8")
+
+    res_o = res_dir / "resource.o"
+    proc = subprocess.run(
+        [WINDOWS_WINDRES, "simulizer.rc", "-o", "resource.o", "--output-format=coff"],
+        cwd=str(res_dir),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"아이콘 리소스 컴파일 실패 (windres):\n{(proc.stderr or proc.stdout or '').strip()}",
+        )
+    return res_o
 
 
 def _validate_segment(name: str):
@@ -301,6 +512,12 @@ def _materialize_tree(nodes: list, root: Path, parent_rel: str = ""):
         rel = f"{parent_rel}/{name}" if parent_rel else name
         if kind == "file":
             ext = Path(name).suffix.lower()
+            # config/data JSON and binary assets (icons) ride along in the tree
+            # but aren't translation units — skip them so only .cpp/.hpp ever
+            # land in the compile sandbox. They're read separately (config parse
+            # / icon resolution) straight from the tree data.
+            if ext in _NONSOURCE_SKIP_EXTENSIONS:
+                continue
             if ext not in ALLOWED_BUNDLE_EXTENSIONS:
                 raise HTTPException(
                     status_code=400,
@@ -354,12 +571,13 @@ def compile(body: CompileRequest):
 
 class BuildRequest(BaseModel):
     # lang="blocks": legacy Blockly JSON in `code`.
-    # lang="cpp":    multi-file bundle in `tree` + `entry`.
+    # lang="cpp":    multi-file bundle in `tree` + `entry`. Compile options and
+    #               the exe icon are read server-side from the tree's config.json
+    #               and .ico files — not sent as separate fields.
     lang: str = "blocks"
     code: Optional[str] = None
     tree: Optional[list] = None
     entry: Optional[str] = None
-    options: CompileOptions = CompileOptions()
 
 
 def _write_status(out_dir: Path, status: str, **extra):
@@ -391,7 +609,8 @@ BUILD_TOTAL = len(BUILD_STAGES) + 1
 
 def _stream_build(file_uuid: str, out_dir: Path, cpp_file: Path, exe_file: Path,
                   project_root: Path, system_dir: Path, target: BuildTarget,
-                  data_cpp: Optional[Path], flags: ResolvedFlags):
+                  data_cpp: Optional[Path], flags: ResolvedFlags,
+                  res_override: Optional[Path] = None):
     # The -I paths are restricted to per-build staging dirs so user code cannot
     # reach backend Python sources, the auth `key/` dir, prompts, etc. via
     # #include. Only the headers in _BUILD_SYSTEM_FILES land in system_dir.
@@ -404,6 +623,7 @@ def _stream_build(file_uuid: str, out_dir: Path, cpp_file: Path, exe_file: Path,
         out_dir=out_dir,
         data_cpp=data_cpp,
         flags=flags,
+        res_override=res_override,
     )
 
     yield f"data: {json.dumps({'uuid': file_uuid, 'step': 0, 'total': BUILD_TOTAL, 'message': '빌드 준비'})}\n\n"
@@ -456,15 +676,17 @@ int main() {
 
 @router.post("/build")
 def build(body: BuildRequest, request: Request, system: Optional[str] = None):
-    # Validate the compile options (optimization/std/defines) before they reach
+    # Resolve compile options from the bundle's config.json (server-side source
+    # of truth), then validate them (optimization/std/defines) before they reach
     # the command line.
-    flags = _resolve_flags(body.options)
+    opts = _compile_options_from_tree(body.tree)
+    flags = _resolve_flags(opts)
 
     # Build for the requesting client's OS. Precedence: explicit `?system=`
-    # query → compile.json `system` → User-Agent sniff. "auto"/None means sniff.
+    # query → config.json `system` → User-Agent sniff. "auto"/None means sniff.
     requested_system = system
-    if not requested_system and body.options.system and body.options.system != "auto":
-        requested_system = body.options.system
+    if not requested_system and opts.system and opts.system != "auto":
+        requested_system = opts.system
     os_key = _resolve_target_os(requested_system, request.headers.get("user-agent", ""))
     target = TARGETS[os_key]
 
@@ -521,33 +743,54 @@ def build(body: BuildRequest, request: Request, system: Optional[str] = None):
         cpp_file = entry_path
     exe_file = out_dir / target.out_name
 
+    # Custom exe icon: resolve the relative compile.icon path within the tree to
+    # .ico bytes (traversal-safe), then embed it. Only Windows links a Win32
+    # resource, so the icon is applied there and ignored for Linux/macOS.
+    res_override: Optional[Path] = None
+    if os_key == "windows":
+        icon_bytes = _resolve_icon_from_tree(body.tree, opts.icon)
+        if icon_bytes:
+            res_override = _build_windows_resource(out_dir, icon_bytes)
+
     return StreamingResponse(
-        _stream_build(file_uuid, out_dir, cpp_file, exe_file, project_root, system_dir, target, data_cpp, flags),
+        _stream_build(file_uuid, out_dir, cpp_file, exe_file, project_root, system_dir, target, data_cpp, flags, res_override),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 class EmccRequest(BaseModel):
+    # Compile options are read server-side from the tree's config.json.
     tree: list
     entry: str
-    options: CompileOptions = CompileOptions()
 
 
 _WORKER_ENTRY_SHIM = (
     '\n#include <type_traits>\n'
+    '#include <cstdio>\n'
     'template<typename F> int __sim_invoke_or_zero(F f) {\n'
     '    if constexpr (std::is_void_v<decltype(f())>) { f(); return 0; }\n'
     '    else { return f(); }\n'
     '}\n'
-    'extern "C" __attribute__((used)) int __sim_worker_entry() { return __sim_invoke_or_zero(worker); }\n'
+    # worker() returns without calling exit(), so the WASI libc never flushes
+    # its (fully-buffered, non-tty) stdout — output would be lost. Make the
+    # streams unbuffered so printf/cout appear immediately (incremental output
+    # is also what a debugger wants), and flush once more on the way out.
+    'extern "C" __attribute__((used)) int __sim_worker_entry() {\n'
+    '    static bool __sim_io_init = []{ setvbuf(stdout, nullptr, _IONBF, 0); setvbuf(stderr, nullptr, _IONBF, 0); return true; }();\n'
+    '    (void)__sim_io_init;\n'
+    '    int __sim_r = __sim_invoke_or_zero(worker);\n'
+    '    std::fflush(nullptr);\n'
+    '    return __sim_r;\n'
+    '}\n'
 )
 
 
 @router.post("/emcc")
 def emcc(body: EmccRequest):
-    # `system` is a Build-only concept; Run honors optimization/std/defines.
-    flags = _resolve_flags(body.options)
+    # Compile options come from the bundle's config.json (server-side). `system`
+    # is a Build-only concept; Run honors optimization/std/defines.
+    flags = _resolve_flags(_compile_options_from_tree(body.tree))
     file_uuid = str(uuid.uuid4())
     out_dir = path_temp / file_uuid
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -587,6 +830,10 @@ def emcc(body: EmccRequest):
             "-sERROR_ON_UNDEFINED_SYMBOLS=0",
             "-sEXPORTED_FUNCTIONS=['___sim_worker_entry']",
             "-fno-exceptions",
+            # Build a WASI *reactor* (no main/_start): the worker calls
+            # __sim_worker_entry directly, so we just need `_initialize` to run
+            # the global constructors (e.g. std::ios_base::Init for std::cout).
+            "--no-entry",
             "-Wl,--allow-undefined",
         ]
 
@@ -609,6 +856,87 @@ def emcc(body: EmccRequest):
             content=wasm_file.read_bytes(),
             media_type="application/wasm",
         )
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+@router.post("/emcc/debug")
+def emcc_debug(body: EmccRequest):
+    """Debug counterpart of /compile/emcc. Builds an *instrumented*, Asyncify-
+    enabled standalone WASM at -O0 -g plus a "rich sidecar" of type/line/variable
+    metadata, so the Web Worker can offer breakpoints, stepping, a call stack and
+    variable inspection over the user's own C++. Returns a JSON envelope
+    `{"wasm": <base64>, "sidecar": {...}}` (Run still returns raw wasm)."""
+    opts = _compile_options_from_tree(body.tree)
+    flags = _resolve_flags(opts)
+    file_uuid = str(uuid.uuid4())
+    out_dir = path_temp / file_uuid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        project_root = out_dir / "project"
+        project_root.mkdir(parents=True, exist_ok=True)
+        system_dir = out_dir / "_system"
+        system_dir.mkdir(parents=True, exist_ok=True)
+        _stage_build_system(system_dir)
+        _materialize_tree(body.tree, project_root)
+        entry_path = _resolve_entry(body.tree, body.entry, project_root)
+
+        # Instrument every user file the entry TU touches (rewrites them in place)
+        # and capture the sidecar BEFORE appending the worker-entry shim, so the
+        # shim itself isn't instrumented and the parse sees the user's real code.
+        try:
+            sidecar = instrument_tu(
+                entry_path, project_root, system_dir, flags.std_flag, flags.define_flags
+            )
+        except Exception as e:  # parse produced no usable AST
+            raise HTTPException(status_code=422, detail=f"디버그 계측 실패: {e}")
+
+        entry_path.write_text(
+            entry_path.read_text(encoding="utf-8") + _WORKER_ENTRY_SHIM,
+            encoding="utf-8",
+        )
+
+        wasm_file = out_dir / "user.wasm"
+
+        # Same standalone-wasm shape as Run, but: -O0 -g for faithful stepping,
+        # ASYNCIFY so __sim_dbg_line can unwind/rewind to pause, and malloc/free
+        # exported so the worker can allocate the Asyncify stack region. Only
+        # __sim_dbg_line is an async import (the other hooks never unwind).
+        EMCC_COMMAND = [
+            "em++",
+            str(entry_path),
+            flags.std_flag,
+            "-o", str(wasm_file),
+            f"-I{system_dir}",
+            f"-I{project_root}",
+            "-O0", "-g",
+            *flags.define_flags,
+            "-sSTANDALONE_WASM=1",
+            "-sERROR_ON_UNDEFINED_SYMBOLS=0",
+            "-sASYNCIFY=1",
+            "-sASYNCIFY_IMPORTS=['__sim_dbg_line']",
+            "-sEXPORTED_FUNCTIONS=['___sim_worker_entry','_malloc','_free']",
+            "-fno-exceptions",
+            # WASI reactor (see /compile/emcc): `_initialize` runs the global
+            # constructors so std::cout & user global objects work.
+            "--no-entry",
+            "-Wl,--allow-undefined",
+        ]
+
+        # shell=True for the same reason as /compile/emcc (em++ is a launcher
+        # script). Every interpolated token is server-generated or server-
+        # validated (std/opt enums, identifier-only defines, uuid paths).
+        proc = subprocess.run(
+            EMCC_COMMAND,
+            capture_output=True,
+            text=True,
+            shell=True,
+        )
+        if proc.returncode != 0:
+            raise HTTPException(status_code=422, detail=proc.stderr)
+
+        wasm_b64 = base64.b64encode(wasm_file.read_bytes()).decode("ascii")
+        return {"wasm": wasm_b64, "sidecar": sidecar}
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 

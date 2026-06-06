@@ -480,40 +480,26 @@ def _make_session_dir() -> Path:
     return d
 
 
-@router.websocket("/cpp")
-async def lsp_cpp(ws: WebSocket):
-    await ws.accept()
-    client = f"{ws.client.host if ws.client else '?'}"
-    print(f"[lsp] /cpp accept from {client}", flush=True)
+def _clangd_args(clangd_path: str) -> list[str]:
+    return [
+        clangd_path,
+        "--background-index=true",
+        "--pch-storage=memory",
+        "--header-insertion=never",
+        "--clang-tidy=false",
+        "--completion-style=bundled",
+        "--limit-results=20",
+        "-j=4",
+        "--log=error",
+    ]
 
-    try:
-        clangd_path = _resolve_clangd()
-    except RuntimeError as e:
-        print(f"[lsp] clangd not found: {e}", flush=True)
-        await ws.close(code=1011, reason=str(e))
-        return
 
-    session_dir = _make_session_dir()
-    server_prefix = _make_server_prefix(session_dir)
-    server_to_client, client_to_server = _make_rewriters(server_prefix)
-    print(f"[lsp] session dir: {session_dir}", flush=True)
-
+def _spawn_clangd(session_dir: Path) -> subprocess.Popen:
     creation_flags = 0
     if os.name == "nt":
         creation_flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-
-    proc = subprocess.Popen(
-        [
-            clangd_path,
-            "--background-index=true",
-            "--pch-storage=memory",
-            "--header-insertion=never",
-            "--clang-tidy=false",
-            "--completion-style=bundled",
-            "--limit-results=20",
-            "-j=4",
-            "--log=error",
-        ],
+    return subprocess.Popen(
+        _clangd_args(_resolve_clangd()),
         cwd=str(session_dir),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -521,7 +507,187 @@ async def lsp_cpp(ws: WebSocket):
         creationflags=creation_flags,
     )
 
-    print(f"[lsp] clangd started pid={proc.pid} cwd={session_dir}", flush=True)
+
+# --- warm clangd pool -------------------------------------------------------
+# A WebSocket connect otherwise pays the full cold cost of launching clangd:
+# loading the (large) clangd.exe + its DLLs, plus an AV scan on Windows. That
+# is the dominant "connection is slow" latency. We keep a few clangd processes
+# pre-spawned and idle (a clangd does nothing until it receives `initialize`,
+# so an idle one is cheap and holds no preamble yet) and hand one off on
+# connect, refilling the pool in the background.
+#
+# NOTE: this removes process-launch from the connect path and lets the
+# preamble build start sooner, but it does NOT pre-build the STL preamble:
+# clangd's preamble is keyed per main-file path and can't be built before the
+# client's own `initialize` arrives, so each session still parses the STL on
+# its first request. Eliminating that would need a prebuilt PCH (a separate
+# change).
+
+CLANGD_POOL_SIZE = int(os.environ.get("CLANGD_POOL_SIZE", "2"))
+
+
+class _PooledClangd:
+    __slots__ = ("proc", "session_dir")
+
+    def __init__(self, proc: subprocess.Popen, session_dir: Path):
+        self.proc = proc
+        self.session_dir = session_dir
+
+
+_pool: list[_PooledClangd] = []
+_pool_lock = asyncio.Lock()
+_replenishing = False
+
+
+def _spawn_pooled() -> _PooledClangd:
+    """Blocking: create a session dir and launch a clangd bound to it. The
+    process and its session dir travel together (cwd + URI namespace)."""
+    session_dir = _make_session_dir()
+    proc = _spawn_clangd(session_dir)
+    print(f"[lsp] pooled clangd pid={proc.pid} cwd={session_dir}", flush=True)
+    return _PooledClangd(proc, session_dir)
+
+
+def _discard_pooled(entry: _PooledClangd):
+    """Blocking: terminate a pooled process we won't use and remove its dir."""
+    try:
+        if entry.proc.poll() is None:
+            entry.proc.terminate()
+            try:
+                entry.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                entry.proc.kill()
+                entry.proc.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    shutil.rmtree(entry.session_dir, ignore_errors=True)
+
+
+async def _replenish_pool():
+    """Top the pool back up to CLANGD_POOL_SIZE, one spawn at a time. Guarded
+    so concurrent connects don't overshoot the target."""
+    global _replenishing
+    if _replenishing or CLANGD_POOL_SIZE <= 0:
+        return
+    _replenishing = True
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            async with _pool_lock:
+                need = CLANGD_POOL_SIZE - len(_pool)
+            if need <= 0:
+                return
+            try:
+                entry = await loop.run_in_executor(None, _spawn_pooled)
+            except Exception as e:  # noqa: BLE001
+                print(f"[lsp] pool spawn failed: {type(e).__name__}: {e}", flush=True)
+                return
+            async with _pool_lock:
+                if len(_pool) < CLANGD_POOL_SIZE:
+                    _pool.append(entry)
+                    entry = None
+            if entry is not None:  # raced past the target; drop it
+                await loop.run_in_executor(None, _discard_pooled, entry)
+    finally:
+        _replenishing = False
+
+
+def _schedule_replenish():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_replenish_pool())
+
+
+async def _acquire_clangd() -> _PooledClangd:
+    """Return a ready clangd + its session dir. Pops a warm one if available;
+    otherwise spawns synchronously (off the event loop). Either way the pool
+    is refilled in the background. May raise if clangd can't be launched."""
+    loop = asyncio.get_running_loop()
+    async with _pool_lock:
+        while _pool:
+            entry = _pool.pop()
+            if entry.proc.poll() is None:
+                _schedule_replenish()
+                return entry
+            # A pooled process died before use — clean it and try the next.
+            await loop.run_in_executor(None, _discard_pooled, entry)
+    entry = await loop.run_in_executor(None, _spawn_pooled)
+    _schedule_replenish()
+    return entry
+
+
+async def warm_clangd_pool():
+    """Fill the pool at startup so the first connect is fast too. No-op (with
+    a log) if pooling is disabled or clangd isn't found."""
+    if CLANGD_POOL_SIZE <= 0:
+        return
+    try:
+        _resolve_clangd()
+    except RuntimeError as e:
+        print(f"[lsp] clangd not found; warm pool disabled: {e}", flush=True)
+        return
+    await _replenish_pool()
+
+
+async def shutdown_clangd_pool():
+    """Terminate any still-pooled processes and remove their session dirs."""
+    loop = asyncio.get_running_loop()
+    async with _pool_lock:
+        entries = list(_pool)
+        _pool.clear()
+    for e in entries:
+        await loop.run_in_executor(None, _discard_pooled, e)
+
+
+def _sweep_stale_sessions_blocking() -> int:
+    """Remove every session dir under SESSIONS_ROOT. Safe to call only at
+    startup: no session is active yet, so anything here is an orphan left by
+    a prior hard-kill (graceful disconnect already rmtree's its own dir).
+    Returns the number of dirs removed."""
+    removed = 0
+    for child in SESSIONS_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        # ignore_errors hides Windows .cache locks; count only true removals.
+        if not child.exists():
+            removed += 1
+    return removed
+
+
+async def sweep_stale_sessions():
+    """Clear orphaned clangd session dirs at startup. MUST run before
+    warm_clangd_pool, which creates fresh dirs we don't want swept."""
+    loop = asyncio.get_running_loop()
+    try:
+        removed = await loop.run_in_executor(None, _sweep_stale_sessions_blocking)
+    except Exception as e:  # noqa: BLE001
+        print(f"[lsp] session sweep failed: {type(e).__name__}: {e}", flush=True)
+        return
+    if removed:
+        print(f"[lsp] swept {removed} stale session dir(s)", flush=True)
+
+
+@router.websocket("/cpp")
+async def lsp_cpp(ws: WebSocket):
+    await ws.accept()
+    client = f"{ws.client.host if ws.client else '?'}"
+    print(f"[lsp] /cpp accept from {client}", flush=True)
+
+    try:
+        pooled = await _acquire_clangd()
+    except Exception as e:  # noqa: BLE001 — clangd missing or launch failure
+        print(f"[lsp] clangd unavailable: {type(e).__name__}: {e}", flush=True)
+        await ws.close(code=1011, reason="clangd unavailable")
+        return
+
+    proc = pooled.proc
+    session_dir = pooled.session_dir
+    server_prefix = _make_server_prefix(session_dir)
+    server_to_client, client_to_server = _make_rewriters(server_prefix)
+    print(f"[lsp] session dir: {session_dir} (clangd pid={proc.pid})", flush=True)
     # The three pumps don't have symmetric lifetimes: _ws_to_stdin returns as
     # soon as the client disconnects, but _stdout_to_ws and _stderr_to_console
     # are blocked on executor threads doing pipe reads that only unblock when

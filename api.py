@@ -1,5 +1,6 @@
 import base64
 import json
+from contextlib import asynccontextmanager
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from routes.compile import router as compile_router
 from routes.lsp import router as lsp_router
+from routes.lsp import warm_clangd_pool, shutdown_clangd_pool, sweep_stale_sessions
 
 
 #asdf
@@ -33,7 +35,18 @@ path_prompt_ocr = path_here / "prompt" / "ocr.txt"
 OCR_PROMPT = path_prompt_ocr.read_text(encoding="utf-8").strip()
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Clear orphaned session dirs from prior hard-kills, then pre-spawn clangd
+    # so the first LSP connect doesn't pay the cold launch. Order matters: the
+    # sweep must run before warming, which creates fresh pool dirs.
+    await sweep_stale_sessions()
+    await warm_clangd_pool()
+    yield
+    await shutdown_clangd_pool()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 client = Groq(api_key=groq_api_key)
