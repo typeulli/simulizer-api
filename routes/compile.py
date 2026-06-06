@@ -3,10 +3,11 @@ import re
 import shutil
 import subprocess
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -21,6 +22,45 @@ path_bin = path_here / "bin"
 
 
 ALLOWED_BUNDLE_EXTENSIONS = (".cpp", ".hpp")
+
+
+# ── Compile options (from the project's compile.json, sent by the frontend) ──
+#
+# The frontend parses compile.json and forwards the resolved options here. We
+# re-validate everything server-side (defense in depth) before it reaches a
+# compiler command line: optimization/std are closed enums, and each define
+# must be a bare identifier (optionally `=value`) — no spaces or shell-special
+# characters — so nothing user-controlled can inject extra arguments.
+_OPT_LEVELS = {"O0", "O1", "O2", "O3", "Os"}
+_STDS = {"c++17", "c++20", "c++23"}
+_DEFINE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[A-Za-z0-9_.]+)?$')
+
+
+class CompileOptions(BaseModel):
+    system: Optional[str] = None       # auto/None → sniff User-Agent (Build only)
+    optimization: str = "O3"
+    std: str = "c++17"
+    defines: list[str] = []
+
+
+@dataclass(frozen=True)
+class ResolvedFlags:
+    std_flag: str          # e.g. "-std=c++17"
+    opt_flag: str          # e.g. "-O3"
+    define_flags: list[str]  # e.g. ["-DDEBUG", "-DVERSION=2"]
+
+
+def _resolve_flags(opts: CompileOptions) -> ResolvedFlags:
+    if opts.optimization not in _OPT_LEVELS:
+        raise HTTPException(status_code=400, detail=f"Invalid optimization: {opts.optimization!r}")
+    if opts.std not in _STDS:
+        raise HTTPException(status_code=400, detail=f"Invalid std: {opts.std!r}")
+    define_flags: list[str] = []
+    for d in opts.defines:
+        if not isinstance(d, str) or not _DEFINE_RE.match(d):
+            raise HTTPException(status_code=400, detail=f"Invalid define: {d!r}")
+        define_flags.append(f"-D{d}")
+    return ResolvedFlags(std_flag=f"-std={opts.std}", opt_flag=f"-{opts.optimization}", define_flags=define_flags)
 
 
 # Headers the build needs to see when compiling user code. We stage them into
@@ -48,6 +88,139 @@ def _stage_build_system(system_dir: Path):
         dst = system_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+
+# ── Per-OS build targets ──────────────────────────────────────────────────
+#
+# We build the user's program for the *requesting* OS, not the server's. The
+# Windows host has no native Linux/Darwin compiler, so:
+#   - windows: native MinGW g++ (links the prebuilt resource.o icon/manifest
+#              and binary_data.o, plus the Win32 PDH/Winsock/GDI libs).
+#   - linux  : g++ inside a Docker container.
+#   - macos  : osxcross' clang inside a Docker container.
+# For non-Windows targets the Win32 resource object and PDH/Winsock/GDI libs
+# are dropped (simstd.hpp gates those behind `_WIN32`) and the portable
+# embedded-asset data is recompiled from source inside the container.
+WINDOWS_GXX = "C:/mingw64/bin/g++.exe"
+LINUX_BUILD_IMAGE = "gcc:13"
+# Apple's SDK can't ship in a public image, so this points at a locally-built
+# osxcross image; `o64-clang++` is its C++ driver. Build the image separately
+# before serving macOS targets.
+MACOS_BUILD_IMAGE = "simulizer/osxcross:latest"
+MACOS_GXX = "o64-clang++"
+
+
+@dataclass(frozen=True)
+class BuildTarget:
+    key: str            # canonical OS key
+    out_name: str       # filename of the produced binary inside out_dir
+    download_name: str  # filename presented to the client
+
+
+TARGETS = {
+    "windows": BuildTarget("windows", "output.exe", "output.exe"),
+    "linux":   BuildTarget("linux",   "output",     "output"),
+    "macos":   BuildTarget("macos",   "output",     "output"),
+}
+
+_SYSTEM_ALIASES = {
+    "windows": "windows", "win": "windows", "win32": "windows", "win64": "windows",
+    "linux": "linux", "ubuntu": "linux", "debian": "linux",
+    "macos": "macos", "mac": "macos", "osx": "macos", "darwin": "macos",
+}
+
+
+def _resolve_target_os(system: Optional[str], user_agent: str) -> str:
+    """Pick the target OS. An explicit `system=` query param wins; otherwise we
+    sniff the User-Agent. Defaults to windows when nothing matches."""
+    if system:
+        key = _SYSTEM_ALIASES.get(system.strip().lower())
+        if key is None:
+            raise HTTPException(status_code=400, detail=f"Unsupported system: {system!r}")
+        return key
+    ua = (user_agent or "").lower()
+    if "windows" in ua:
+        return "windows"
+    if "mac" in ua or "darwin" in ua or "iphone" in ua or "ipad" in ua:
+        return "macos"
+    if "linux" in ua or "android" in ua or "x11" in ua:
+        return "linux"
+    return "windows"
+
+
+# Portable embedded-asset sources (pure byte arrays — no Win32 API). Windows
+# links the prebuilt bin/binary_data.o; other targets recompile these inside
+# the build container.
+_BUILD_DATA_FILES = (
+    "binary_data.cpp", "console.hpp", "console.html.hpp", "index.html.hpp",
+)
+
+
+def _stage_build_data(data_dir: Path) -> Path:
+    """Copy the embedded-asset sources into `data_dir` (all relative includes
+    resolve from there since the headers sit beside binary_data.cpp) and return
+    the path to binary_data.cpp."""
+    src_dir = path_here / "lib" / "bin"
+    for name in _BUILD_DATA_FILES:
+        shutil.copy2(src_dir / name, data_dir / name)
+    return data_dir / "binary_data.cpp"
+
+
+def _build_argv(os_key: str, *, cpp_file: Path, exe_file: Path, system_dir: Path,
+                project_root: Path, out_dir: Path, data_cpp: Optional[Path],
+                flags: ResolvedFlags) -> list[str]:
+    """Assemble the compiler command line for the given target OS. Windows runs
+    natively; Linux/macOS wrap g++/clang in `docker run`, mounting out_dir at
+    /work so every path the compiler touches lives under the bind mount."""
+    if os_key == "windows":
+        res_file = path_bin / "resource.o"
+        bin_file = path_bin / "binary_data.o"
+        return [
+            WINDOWS_GXX,
+            str(cpp_file),
+            str(res_file), str(bin_file),
+            flags.std_flag,
+            "-o", str(exe_file),
+            f"-I{system_dir}",
+            f"-I{project_root}",
+            flags.opt_flag,
+            *flags.define_flags,
+            "-pthread", "-lpdh", "-lws2_32", "-lgdi32",
+            "-static-libgcc", "-static-libstdc++",
+            "-Wl,-Bstatic", "-lstdc++", "-lpthread", "-Wl,-Bdynamic",
+            "-v",
+        ]
+
+    assert data_cpp is not None, "non-Windows builds need the staged data source"
+
+    def c(p: Path) -> str:
+        # Host path under out_dir → container path under /work.
+        return "/work/" + Path(p).relative_to(out_dir).as_posix()
+
+    common = [
+        c(cpp_file), c(data_cpp),
+        flags.std_flag,
+        "-o", c(exe_file),
+        f"-I{c(system_dir)}",
+        f"-I{c(project_root)}",
+        flags.opt_flag,
+        *flags.define_flags,
+        "-pthread",
+        "-v",
+    ]
+    if os_key == "linux":
+        inner = ["g++", *common, "-static-libgcc", "-static-libstdc++"]
+        image = LINUX_BUILD_IMAGE
+    else:  # macos
+        inner = [MACOS_GXX, *common]
+        image = MACOS_BUILD_IMAGE
+    return [
+        "docker", "run", "--rm",
+        "-v", f"{out_dir}:/work",
+        "-w", "/work",
+        image,
+        *inner,
+    ]
 
 
 def _validate_segment(name: str):
@@ -186,6 +359,7 @@ class BuildRequest(BaseModel):
     code: Optional[str] = None
     tree: Optional[list] = None
     entry: Optional[str] = None
+    options: CompileOptions = CompileOptions()
 
 
 def _write_status(out_dir: Path, status: str, **extra):
@@ -200,37 +374,37 @@ def _read_status(out_dir: Path) -> dict:
         return {}
 
 
+# `.exe` is optional so the same patterns match both MinGW (cc1plus.exe) and
+# the Linux/macOS toolchains (cc1plus); clang prints `cc1` rather than the
+# collect2/as banners, so some stages simply won't fire there — progress is
+# cosmetic and the build still completes.
 BUILD_STAGES = [
-    (re.compile(r'cc1plus\.exe'),           "컴파일 시작"),
-    (re.compile(r'GNU C\+\+\d+.*version'),  "컴파일러 초기화"),
-    (re.compile(r'End of search list\.'),   "헤더 탐색 완료"),
-    (re.compile(r'as\.exe'),                "어셈블 중"),
-    (re.compile(r'GNU assembler version'),  "어셈블 시작"),
-    (re.compile(r'collect2\.exe'),          "링킹 중"),
+    (re.compile(r'cc1(?:plus)?(?:\.exe)?'),  "컴파일 시작"),
+    (re.compile(r'GNU C\+\+\d+.*version'),   "컴파일러 초기화"),
+    (re.compile(r'End of search list\.'),    "헤더 탐색 완료"),
+    (re.compile(r'[\\/]as(?:\.exe)?[ "\t]'), "어셈블 중"),
+    (re.compile(r'GNU assembler version'),   "어셈블 시작"),
+    (re.compile(r'collect2(?:\.exe)?'),      "링킹 중"),
 ]
 BUILD_TOTAL = len(BUILD_STAGES) + 1
 
 
-def _stream_build(file_uuid: str, out_dir: Path, cpp_file: Path, exe_file: Path, project_root: Path, system_dir: Path):
-    res_file = path_bin / "resource.o"
-    bin_file = path_bin / "binary_data.o"
-    BUILD_COMMAND = [
-        "C:/mingw64/bin/g++.exe",
-        str(cpp_file),
-        str(res_file), str(bin_file),
-        "-std=c++17",
-        "-o", str(exe_file),
-        # Restricted to a per-build staging dir so user code cannot reach
-        # backend Python sources, the auth `key/` dir, prompts, etc. via
-        # #include. Only the headers in _BUILD_SYSTEM_FILES land here.
-        f"-I{system_dir}",
-        f"-I{project_root}",
-        "-O3",
-        "-pthread", "-lpdh", "-lws2_32", "-lgdi32",
-        "-static-libgcc", "-static-libstdc++",
-        "-Wl,-Bstatic", "-lstdc++", "-lpthread", "-Wl,-Bdynamic",
-        "-v",
-    ]
+def _stream_build(file_uuid: str, out_dir: Path, cpp_file: Path, exe_file: Path,
+                  project_root: Path, system_dir: Path, target: BuildTarget,
+                  data_cpp: Optional[Path], flags: ResolvedFlags):
+    # The -I paths are restricted to per-build staging dirs so user code cannot
+    # reach backend Python sources, the auth `key/` dir, prompts, etc. via
+    # #include. Only the headers in _BUILD_SYSTEM_FILES land in system_dir.
+    BUILD_COMMAND = _build_argv(
+        target.key,
+        cpp_file=cpp_file,
+        exe_file=exe_file,
+        system_dir=system_dir,
+        project_root=project_root,
+        out_dir=out_dir,
+        data_cpp=data_cpp,
+        flags=flags,
+    )
 
     yield f"data: {json.dumps({'uuid': file_uuid, 'step': 0, 'total': BUILD_TOTAL, 'message': '빌드 준비'})}\n\n"
 
@@ -259,9 +433,9 @@ def _stream_build(file_uuid: str, out_dir: Path, cpp_file: Path, exe_file: Path,
         yield f"event: error\ndata: {json.dumps({'detail': stderr_text})}\n\n"
         return
 
-    _write_status(out_dir, "ready")
+    _write_status(out_dir, "ready", out_name=target.out_name, download_name=target.download_name)
     yield f"data: {json.dumps({'step': BUILD_TOTAL, 'total': BUILD_TOTAL, 'message': '완료'})}\n\n"
-    yield f"event: done\ndata: {json.dumps({'uuid': file_uuid})}\n\n"
+    yield f"event: done\ndata: {json.dumps({'uuid': file_uuid, 'name': target.download_name})}\n\n"
 
 
 _MAIN_SHIM = """
@@ -281,7 +455,19 @@ int main() {
 
 
 @router.post("/build")
-def build(body: BuildRequest):
+def build(body: BuildRequest, request: Request, system: Optional[str] = None):
+    # Validate the compile options (optimization/std/defines) before they reach
+    # the command line.
+    flags = _resolve_flags(body.options)
+
+    # Build for the requesting client's OS. Precedence: explicit `?system=`
+    # query → compile.json `system` → User-Agent sniff. "auto"/None means sniff.
+    requested_system = system
+    if not requested_system and body.options.system and body.options.system != "auto":
+        requested_system = body.options.system
+    os_key = _resolve_target_os(requested_system, request.headers.get("user-agent", ""))
+    target = TARGETS[os_key]
+
     file_uuid = str(uuid.uuid4())
     out_dir = path_temp / file_uuid
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -298,6 +484,14 @@ def build(body: BuildRequest):
     system_dir = out_dir / "_system"
     system_dir.mkdir(parents=True, exist_ok=True)
     _stage_build_system(system_dir)
+
+    # Windows links the prebuilt bin/binary_data.o; non-Windows targets compile
+    # the portable asset data from source inside the build container.
+    data_cpp = None
+    if os_key != "windows":
+        data_dir = out_dir / "_data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        data_cpp = _stage_build_data(data_dir)
 
     if body.lang == "blocks":
         if not body.code:
@@ -325,10 +519,10 @@ def build(body: BuildRequest):
         cpp_file.write_text(full_source, encoding="utf-8")
     else:
         cpp_file = entry_path
-    exe_file = out_dir / "output.exe"
+    exe_file = out_dir / target.out_name
 
     return StreamingResponse(
-        _stream_build(file_uuid, out_dir, cpp_file, exe_file, project_root, system_dir),
+        _stream_build(file_uuid, out_dir, cpp_file, exe_file, project_root, system_dir, target, data_cpp, flags),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -337,6 +531,7 @@ def build(body: BuildRequest):
 class EmccRequest(BaseModel):
     tree: list
     entry: str
+    options: CompileOptions = CompileOptions()
 
 
 _WORKER_ENTRY_SHIM = (
@@ -351,6 +546,8 @@ _WORKER_ENTRY_SHIM = (
 
 @router.post("/emcc")
 def emcc(body: EmccRequest):
+    # `system` is a Build-only concept; Run honors optimization/std/defines.
+    flags = _resolve_flags(body.options)
     file_uuid = str(uuid.uuid4())
     out_dir = path_temp / file_uuid
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -380,11 +577,12 @@ def emcc(body: EmccRequest):
         EMCC_COMMAND = [
             "em++",
             str(entry_path),
-            "-std=c++17",
+            flags.std_flag,
             "-o", str(wasm_file),
             f"-I{system_dir}",
             f"-I{project_root}",
-            "-O3",
+            flags.opt_flag,
+            *flags.define_flags,
             "-sSTANDALONE_WASM=1",
             "-sERROR_ON_UNDEFINED_SYMBOLS=0",
             "-sEXPORTED_FUNCTIONS=['___sim_worker_entry']",
@@ -392,6 +590,12 @@ def emcc(body: EmccRequest):
             "-Wl,--allow-undefined",
         ]
 
+        # `shell=True` is retained because `em++` is a launcher script (.bat /
+        # python shim) that CreateProcess can't exec directly on Windows. It is
+        # safe here: every interpolated token is server-validated — std/opt are
+        # closed enums, defines match a strict identifier regex (no spaces or
+        # shell metacharacters), and all paths are server-generated uuid dirs —
+        # so no user input can inject additional shell arguments.
         proc = subprocess.run(
             EMCC_COMMAND,
             capture_output=True,
@@ -423,7 +627,9 @@ def build_download(uuid: str):
     if status.get("status") != "ready":
         raise HTTPException(status_code=404, detail="File not found")
 
-    exe_file = out_dir / "output.exe"
+    out_name = status.get("out_name", "output.exe")
+    download_name = status.get("download_name", out_name)
+    exe_file = out_dir / out_name
     if not exe_file.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -432,5 +638,5 @@ def build_download(uuid: str):
     return Response(
         content=content,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": "attachment; filename=output.exe"},
+        headers={"Content-Disposition": f"attachment; filename={download_name}"},
     )
