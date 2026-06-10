@@ -17,6 +17,7 @@
 #include <string>
 #include <stdexcept>
 #include <initializer_list>
+#include <random>
 
 using i32 = int32_t;
 using f64 = double;
@@ -80,6 +81,11 @@ extern "C" {
     void __sim_log_arr_f64(const double* ptr, int cap);
     void __sim_log_tensor(int tensor_id);
 
+    // Interactive input: suspends the wasm via Asyncify until the host panel
+    // supplies a value (clang-worker resolves these through __sim_input_*).
+    int    __sim_input_i32();
+    double __sim_input_f64();
+
     int  __sim_debug_bar(int min, int max);
     void __sim_debug_bar_set(int bar_id, int val);
     int  __sim_debug_series();
@@ -105,6 +111,10 @@ extern "C" {
     int    __sim_tensor_perlin(int varid, int rows, int cols);
     int    __sim_tensor_clone(int dst_varid, int src_varid);
     int    __sim_tensor_dispose(int varid);
+
+    int    __sim_tensor_grad(int v);
+    int    __sim_tensor_curl(int v);
+    int    __sim_tensor_lapl(int v);
 
     int    __sim_matrix_create(int varid, int rows, int cols);
     int    __sim_matrix_matmul(int lhs, int rhs);
@@ -239,6 +249,26 @@ inline Tensor<f64> tensor_normal(const std::vector<i32>& shape, f64 mean, f64 st
     return t;
 }
 
+// ── random / input blocks ───────────────────────────────────────────────────
+// Random uses the in-wasm <random> engine (entropy via the host random_get);
+// input delegates to the Asyncify-suspending host imports above.
+inline std::mt19937& _sim_rng() {
+    static std::mt19937 rng(std::random_device{}());
+    return rng;
+}
+inline i32 sim_rand_int(i32 lo, i32 hi) {
+    if (hi < lo) { i32 t = lo; lo = hi; hi = t; }
+    return std::uniform_int_distribution<i32>(lo, hi)(_sim_rng());
+}
+inline f64 sim_rand_range(f64 lo, f64 hi) {
+    return std::uniform_real_distribution<f64>(lo, hi)(_sim_rng());
+}
+inline f64 sim_rand() {
+    return std::uniform_real_distribution<f64>(0.0, 1.0)(_sim_rng());
+}
+inline i32 sim_input_int()   { return __sim_input_i32(); }
+inline f64 sim_input_float() { return __sim_input_f64(); }
+
 // ── matrix blocks ───────────────────────────────────────────────────────────
 inline Tensor<f64> matrix_create(i32 rows, i32 cols) {
     Tensor<f64> t;
@@ -253,6 +283,11 @@ inline Tensor<f64> matrix_matmul(const Tensor<f64>& a, const Tensor<f64>& b) { r
 inline f64         matrix_trace(const Tensor<f64>& a)                    { return __sim_matrix_trace(a.id()); }
 inline f64         matrix_det(const Tensor<f64>& a)                      { return __sim_matrix_det(a.id()); }
 inline Tensor<f64> matrix_inverse(const Tensor<f64>& a)                  { return Tensor<f64>(__sim_matrix_inverse(a.id())); }
+
+// ── field calculus (grad/curl/lapl) ─────────────────────────────────────────
+inline Tensor<f64> tensor_grad(const Tensor<f64>& a) { return Tensor<f64>(__sim_tensor_grad(a.id())); }
+inline Tensor<f64> tensor_curl(const Tensor<f64>& a) { return Tensor<f64>(__sim_tensor_curl(a.id())); }
+inline Tensor<f64> tensor_lapl(const Tensor<f64>& a) { return Tensor<f64>(__sim_tensor_lapl(a.id())); }
 
 // ── debug_log overloads ─────────────────────────────────────────────────────
 inline void debug_log(i32 val)                  { __sim_log_i32(val); }
@@ -1106,6 +1141,25 @@ inline Tensor<f64> tensor_normal(const std::vector<i32>& shape, f64 mean, f64 st
     return t;
 }
 
+// ── random / input blocks ─────────────────────────────────────────────────────
+// Native build: random via <random>, input via stdin (scanf).
+inline std::mt19937& _sim_rng() {
+    static std::mt19937 rng(std::random_device{}());
+    return rng;
+}
+inline i32 sim_rand_int(i32 lo, i32 hi) {
+    if (hi < lo) { i32 t = lo; lo = hi; hi = t; }
+    return std::uniform_int_distribution<i32>(lo, hi)(_sim_rng());
+}
+inline f64 sim_rand_range(f64 lo, f64 hi) {
+    return std::uniform_real_distribution<f64>(lo, hi)(_sim_rng());
+}
+inline f64 sim_rand() {
+    return std::uniform_real_distribution<f64>(0.0, 1.0)(_sim_rng());
+}
+inline i32 sim_input_int()   { i32 v = 0; if (std::scanf("%d", &v)  != 1) v = 0;   return v; }
+inline f64 sim_input_float() { f64 v = 0; if (std::scanf("%lf", &v) != 1) v = 0.0; return v; }
+
 // ── matrix blocks ─────────────────────────────────────────────────────────────
 // All matrices are 2D Tensor<f64> in row-major storage.
 
@@ -1201,6 +1255,59 @@ inline Tensor<f64> matrix_inverse(const Tensor<f64>& a) {
     for (size_t i = 0; i < n; ++i)
         for (size_t j = 0; j < n; ++j) inv(i, j) = m[i * w + n + j];
     return inv;
+}
+
+// ── field calculus (finite differences, unit grid spacing, edges clamped) ─────
+// 2D scalar field = Tensor<f64>({R,C}); 2D vector field = Tensor<f64>({2,R,C})
+// with channel 0 = x-component, channel 1 = y-component.
+namespace _sim_field {
+    inline size_t clampi(long v, size_t hi) {
+        return v < 0 ? 0 : (static_cast<size_t>(v) > hi ? hi : static_cast<size_t>(v));
+    }
+}
+
+// grad: scalar field [R,C] → vector field [2,R,C]  (∂/∂x, ∂/∂y), central diff.
+inline Tensor<f64> tensor_grad(const Tensor<f64>& a) {
+    if (a.dim() != 2) throw std::invalid_argument("tensor_grad: expected a 2D scalar field");
+    using _sim_field::clampi;
+    size_t R = a.shape()[0], C = a.shape()[1];
+    Tensor<f64> out({ static_cast<size_t>(2), R, C });
+    for (size_t r = 0; r < R; ++r)
+        for (size_t c = 0; c < C; ++c) {
+            out(0, r, c) = (a(r, clampi((long)c + 1, C - 1)) - a(r, clampi((long)c - 1, C - 1))) * 0.5;
+            out(1, r, c) = (a(clampi((long)r + 1, R - 1), c) - a(clampi((long)r - 1, R - 1), c)) * 0.5;
+        }
+    return out;
+}
+
+// curl: vector field [2,R,C] → scalar field [R,C]  (∂vy/∂x − ∂vx/∂y), central diff.
+inline Tensor<f64> tensor_curl(const Tensor<f64>& a) {
+    if (a.dim() != 3 || a.shape()[0] != 2)
+        throw std::invalid_argument("tensor_curl: expected a 2D vector field [2,R,C]");
+    using _sim_field::clampi;
+    size_t R = a.shape()[1], C = a.shape()[2];
+    Tensor<f64> out({ R, C });
+    for (size_t r = 0; r < R; ++r)
+        for (size_t c = 0; c < C; ++c) {
+            f64 dvy_dx = (a(1, r, clampi((long)c + 1, C - 1)) - a(1, r, clampi((long)c - 1, C - 1))) * 0.5;
+            f64 dvx_dy = (a(0, clampi((long)r + 1, R - 1), c) - a(0, clampi((long)r - 1, R - 1), c)) * 0.5;
+            out(r, c) = dvy_dx - dvx_dy;
+        }
+    return out;
+}
+
+// lapl: scalar field [R,C] → scalar field [R,C]  (∇² via 5-point stencil).
+inline Tensor<f64> tensor_lapl(const Tensor<f64>& a) {
+    if (a.dim() != 2) throw std::invalid_argument("tensor_lapl: expected a 2D scalar field");
+    using _sim_field::clampi;
+    size_t R = a.shape()[0], C = a.shape()[1];
+    Tensor<f64> out({ R, C });
+    for (size_t r = 0; r < R; ++r)
+        for (size_t c = 0; c < C; ++c)
+            out(r, c) = a(r, clampi((long)c + 1, C - 1)) + a(r, clampi((long)c - 1, C - 1))
+                      + a(clampi((long)r + 1, R - 1), c) + a(clampi((long)r - 1, R - 1), c)
+                      - 4.0 * a(r, c);
+    return out;
 }
 
 // ── debug_log block ───────────────────────────────────────────────────────────

@@ -249,6 +249,15 @@ struct Backend {
     // terminator — callers add it where appropriate).
     virtual std::string func(const std::string &ret, const std::string &name,
                              const std::string &body) const = 0;
+    // Custom function with parameters; `params` is a list of (name, type-kind).
+    virtual std::string func_params(const std::string &ret, const std::string &name,
+                                    const std::vector<std::pair<std::string, std::string>> &params,
+                                    const std::string &body) const = 0;
+    // Struct/record type definition; `fields` is a list of (name, "i32"|"f64").
+    virtual std::string struct_def(const std::string &name,
+                                   const std::vector<std::pair<std::string, std::string>> &fields) const = 0;
+    // Default-constructed struct value expression (e.g. `Pair()` / `new Pair()`).
+    virtual std::string struct_value(const std::string &name) const = 0;
     virtual std::string if_stmt(const std::string &cond, const std::string &body, bool has_body) const = 0;
     virtual std::string if_else(const std::string &cond, const std::string &then_body,
                                 const std::string &else_body) const = 0;
@@ -324,6 +333,24 @@ struct CppBackend : Backend {
     std::string func(const std::string &ret, const std::string &name, const std::string &body) const override {
         return ret + " " + name + "() {\n" + indent(body) + "\n}";
     }
+    std::string func_params(const std::string &ret, const std::string &name,
+                            const std::vector<std::pair<std::string, std::string>> &params,
+                            const std::string &body) const override {
+        std::string ps;
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (i) ps += ", ";
+            ps += spell(params[i].second) + " " + params[i].first;
+        }
+        return ret + " " + name + "(" + ps + ") {\n" + indent(body) + "\n}";
+    }
+    std::string struct_def(const std::string &name,
+                           const std::vector<std::pair<std::string, std::string>> &fields) const override {
+        std::string body;
+        for (auto &f : fields)
+            body += "    " + spell(f.second) + " " + f.first + " = " + (f.second == "i32" ? "0" : "0.0") + ";\n";
+        return "struct " + name + " {\n" + body + "};";
+    }
+    std::string struct_value(const std::string &name) const override { return name + "()"; }
     std::string if_stmt(const std::string &cond, const std::string &body, bool has_body) const override {
         if (has_body) return "if (" + cond + ") {\n" + indent(body) + "\n}";
         return "if (" + cond + ") {\n}";
@@ -383,6 +410,21 @@ struct JsBackend : CppBackend {
     std::string func(const std::string &, const std::string &name, const std::string &body) const override {
         return "function " + name + "() {\n" + indent(body) + "\n}";
     }
+    std::string func_params(const std::string &, const std::string &name,
+                            const std::vector<std::pair<std::string, std::string>> &params,
+                            const std::string &body) const override {
+        std::string ps;
+        for (size_t i = 0; i < params.size(); ++i) { if (i) ps += ", "; ps += params[i].first; }
+        return "function " + name + "(" + ps + ") {\n" + indent(body) + "\n}";
+    }
+    std::string struct_def(const std::string &name,
+                           const std::vector<std::pair<std::string, std::string>> &fields) const override {
+        std::string ctor;
+        for (auto &f : fields)
+            ctor += "        this." + f.first + " = " + (f.second == "i32" ? "0" : "0.0") + ";\n";
+        return "class " + name + " {\n    constructor() {\n" + ctor + "    }\n}";
+    }
+    std::string struct_value(const std::string &name) const override { return "new " + name + "()"; }
     std::string loop_kw() const override { return "let"; }
     std::string region(const std::string &name, const std::string &body, bool has_body) const override {
         if (has_body) return "// #region " + name + "\n" + body + "\n// #endregion";
@@ -453,6 +495,23 @@ struct PyBackend : Backend {
     std::string func(const std::string &, const std::string &name, const std::string &body) const override {
         return "def " + name + "():\n" + indent(body);
     }
+    std::string func_params(const std::string &, const std::string &name,
+                            const std::vector<std::pair<std::string, std::string>> &params,
+                            const std::string &body) const override {
+        std::string ps;
+        for (size_t i = 0; i < params.size(); ++i) { if (i) ps += ", "; ps += params[i].first; }
+        return "def " + name + "(" + ps + "):\n" + indent(body);
+    }
+    std::string struct_def(const std::string &name,
+                           const std::vector<std::pair<std::string, std::string>> &fields) const override {
+        std::string body;
+        for (auto &f : fields)
+            body += "        self." + f.first + " = " + (f.second == "i32" ? "0" : "0.0") + "\n";
+        if (fields.empty()) body = "        pass\n";
+        if (!body.empty() && body.back() == '\n') body.pop_back();
+        return "class " + name + ":\n    def __init__(self):\n" + body;
+    }
+    std::string struct_value(const std::string &name) const override { return name + "()"; }
     std::string if_stmt(const std::string &cond, const std::string &body, bool has_body) const override {
         return "if " + cond + ":\n" + indent(has_body ? body : "pass");
     }
@@ -557,9 +616,50 @@ static std::unordered_set<const J *> scan_tensor_decls(const J &root) {
  * ------------------------------------------------------------------ */
 using Results = std::unordered_map<const J *, Expr>;
 
+// A custom function's call-block type is `custom_func_<funcId>`, where funcId is
+// the definition block's Blockly id with every non-alphanumeric char mapped to
+// '_' (mirrors funcIdOf() in the frontend). Lets call blocks resolve to the
+// function's user-facing name + arity.
+static std::string funcIdOf(const std::string &blocklyId) {
+    std::string out = "f";
+    for (char c : blocklyId) {
+        bool alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        out += alnum ? c : '_';
+    }
+    return out;
+}
+
+struct FuncInfo { std::string name; std::string ret; int paramCount; };
+using FuncTable = std::unordered_map<std::string, FuncInfo>;
+
+// A struct's per-instance block type is `struct_<structId>_{decl,ref,get,set}`,
+// where structId is the definition block's Blockly id sanitized with 's' prefix
+// (mirrors structIdOf() in the frontend). Lets instance blocks resolve to the
+// struct's user-facing name + field layout.
+static std::string structIdOf(const std::string &blocklyId) {
+    std::string out = "s";
+    for (char c : blocklyId) {
+        bool alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        out += alnum ? c : '_';
+    }
+    return out;
+}
+
+struct StructInfo { std::string name; std::vector<std::pair<std::string, std::string>> fields; };
+using StructTable = std::unordered_map<std::string, StructInfo>;  // key = structIdOf(blockId)
+
+static int extra_param_count(const J &node) {
+    if (node.contains("extraState") && node["extraState"].is_object()
+        && node["extraState"].contains("paramCount"))
+        return (int)node["extraState"]["paramCount"].get<long>();
+    return 0;
+}
+
 static Expr compile_block(const J &node, const Results &results,
                           const std::string &main_fn_name,
                           const std::unordered_set<const J *> &first_decls,
+                          const FuncTable &funcs,
+                          const StructTable &structs,
                           const Backend &B) {
     const std::string T = node_type(node);
 
@@ -589,6 +689,96 @@ static Expr compile_block(const J &node, const Results &results,
             throw std::runtime_error("Unsupported RET_TYPE: " + ret_type);
         std::string body_code = D(C("BODY")).code;
         return e_stmt(B.func(ret_type, main_fn_name, body_code));
+    }
+
+    /* ---- custom function definition ---- */
+    if (T == "custom_func_def") {
+        std::string ret = F("RET");
+        if (starts_with(ret, "struct_")) {
+            // Struct return: resolve the struct's user-facing type name.
+            std::string sid = ret.substr(std::string("struct_").size());
+            auto sit = structs.find(sid);
+            ret = (sit != structs.end()) ? sit->second.name : sid;
+        } else if (ret != "i32" && ret != "f64" && ret != "void") {
+            throw std::runtime_error("Unsupported custom function RET: " + ret);
+        }
+        std::string fname = F("NAME");
+        int pc = extra_param_count(node);
+        std::vector<std::pair<std::string, std::string>> params;
+        for (int i = 0; i < pc; ++i) {
+            std::string pname = fstr(node, ("PNAME" + std::to_string(i)).c_str());
+            std::string ptype = fstr(node, ("PTYPE" + std::to_string(i)).c_str());
+            if (starts_with(ptype, "struct_")) {
+                // Struct param: resolve to the struct's user-facing type name.
+                std::string sid = ptype.substr(std::string("struct_").size());
+                auto sit = structs.find(sid);
+                ptype = (sit != structs.end()) ? sit->second.name : sid;
+            }
+            params.push_back({ pname, ptype });
+        }
+        std::string body_code = D(C("BODY")).code;
+        return e_stmt(B.func_params(ret, fname, params, body_code));
+    }
+
+    /* ---- custom function call (`custom_func_<id>`) ---- */
+    if (starts_with(T, "custom_func_") && T != "custom_func_def") {
+        std::string id = T.substr(std::string("custom_func_").size());
+        auto it = funcs.find(id);
+        std::string fname = (it != funcs.end()) ? it->second.name : id;
+        int pc = (it != funcs.end()) ? it->second.paramCount : 0;
+        std::vector<Expr> args;
+        for (int i = 0; i < pc; ++i)
+            args.push_back(D(C(("ARG" + std::to_string(i)).c_str())));
+        if (it != funcs.end() && it->second.ret == "void")
+            return S(e_call(fname, args).code);
+        return e_call(fname, args);
+    }
+
+    /* ---- struct definition ---- */
+    if (T == "struct_def") {
+        std::string name = F("NAME");
+        std::vector<std::pair<std::string, std::string>> fields;
+        const J *f = C("FIELDS");
+        while (f) {
+            if (node_type(*f) == "struct_field")
+                fields.push_back({ fstr(*f, "FNAME"), fstr(*f, "FTYPE") });
+            f = (f->contains("next") && (*f)["next"].is_object() && (*f)["next"].contains("block"))
+                ? &(*f)["next"]["block"] : nullptr;
+        }
+        return e_stmt(B.struct_def(name, fields));
+    }
+    if (T == "struct_field") return e_stmt("");  // consumed by struct_def
+
+    /* ---- struct instance ops (`struct_<id>_{decl,ref,get,set}`) ---- */
+    if (starts_with(T, "struct_") && T != "struct_def" && T != "struct_field") {
+        size_t last = T.rfind('_');
+        std::string op  = T.substr(last + 1);
+        std::string sid = T.substr(std::string("struct_").size(),
+                                   last - std::string("struct_").size());
+        auto it = structs.find(sid);
+        std::string sname = (it != structs.end()) ? it->second.name : sid;
+        std::string var = F("VAR");
+        if (op == "ref") return Expr(var, P_PRIMARY);
+        if (op == "get") return e_member(Expr(var, P_PRIMARY), F("FIELD"));
+        if (op == "set") return S(var + "." + F("FIELD") + " = " + D(C("VALUE")).code);
+        if (op == "decl") {
+            const J *init = C("INIT");
+            if (init) return S(B.decl(sname, var, D(init).code));
+            return S(B.decl_default(sname, var));
+        }
+    }
+
+    /* ---- empty / default value ---- */
+    if (T == "empty_value") {
+        std::string ty = F("TYPE");
+        if (ty == "f64") return Expr("0.0", P_PRIMARY);
+        if (starts_with(ty, "struct_")) {
+            std::string sid = ty.substr(std::string("struct_").size());
+            auto it = structs.find(sid);
+            std::string sname = (it != structs.end()) ? it->second.name : sid;
+            return Expr(B.struct_value(sname), P_POSTFIX);
+        }
+        return Expr("0", P_PRIMARY);
     }
 
     /* ---- constants ---- */
@@ -673,6 +863,15 @@ static Expr compile_block(const J &node, const Results &results,
         return e_call(B.builtin(op), {v});
     }
 
+    /* ---- random ---- */
+    if (T == "i32_random")       return e_call("sim_rand_int",   {D(C("MIN")), D(C("MAX"))});
+    if (T == "f64_random_range") return e_call("sim_rand_range", {D(C("MIN")), D(C("MAX"))});
+    if (T == "f64_random")       return e_call("sim_rand",       {});
+
+    /* ---- input (single-function form; recovered 1:1 by cpp2block) ---- */
+    if (T == "input_i32") return e_call("sim_input_int",   {});
+    if (T == "input_f64") return e_call("sim_input_float", {});
+
     /* ---- control flow ---- */
     if (T == "flow_if") {
         const J *cond = C("COND");
@@ -716,6 +915,8 @@ static Expr compile_block(const J &node, const Results &results,
         return S("return 0");
     }
     if (T == "wasm_return_f64")
+        return S("return " + D(C("VALUE")).code);
+    if (T == "wasm_return_struct")
         return S("return " + D(C("VALUE")).code);
 
     /* ---- debug ---- */
@@ -786,6 +987,9 @@ static Expr compile_block(const J &node, const Results &results,
         if (op == "neg") return e_unary("-", D(C("TENSOR")));
         throw std::runtime_error("Unsupported tensor unary operator: " + op);
     }
+    if (T == "tensor_grad") return e_call("tensor_grad", {D(C("TENSOR"))});
+    if (T == "tensor_curl") return e_call("tensor_curl", {D(C("TENSOR"))});
+    if (T == "tensor_lapl") return e_call("tensor_lapl", {D(C("TENSOR"))});
     if (T == "tensor_scale")
         return e_binop(D(C("TENSOR")), "*", D(C("SCALAR")), P_MUL);
 
@@ -923,7 +1127,8 @@ static Expr compile_block(const J &node, const Results &results,
 /* ------------------------------------------------------------------ *
  *  Iterative post-order compile of a block tree.
  * ------------------------------------------------------------------ */
-static Expr dfs(const J &root, const std::string &main_fn_name, const Backend &B) {
+static Expr dfs(const J &root, const std::string &main_fn_name,
+                const FuncTable &funcs, const StructTable &structs, const Backend &B) {
     auto first_decls = scan_tensor_decls(root);
     Results results;
     std::deque<std::pair<const J *, bool>> stack;
@@ -933,7 +1138,7 @@ static Expr dfs(const J &root, const std::string &main_fn_name, const Backend &B
         auto [block, visited] = stack.back();
         stack.pop_back();
         if (visited) {
-            results[block] = compile_block(*block, results, main_fn_name, first_decls, B);
+            results[block] = compile_block(*block, results, main_fn_name, first_decls, funcs, structs, B);
             continue;
         }
         if (results.count(block)) continue;
@@ -942,6 +1147,41 @@ static Expr dfs(const J &root, const std::string &main_fn_name, const Backend &B
             if (!results.count(c)) stack.push_back({c, false});
     }
     return results[&root];
+}
+
+// Build the id → {name, ret, paramCount} table from the canvas definition blocks
+// so call blocks can resolve to a name + arity.
+static FuncTable collect_funcs(const J &blocks) {
+    FuncTable funcs;
+    for (const J &block : blocks["blocks"]) {
+        if (node_type(block) != "custom_func_def") continue;
+        if (!block.contains("id")) continue;
+        std::string id = funcIdOf(block["id"].get<std::string>());
+        funcs[id] = { fstr(block, "NAME"), fstr(block, "RET"), extra_param_count(block) };
+    }
+    return funcs;
+}
+
+// Build the id → {name, fields} table from the canvas struct_def blocks so
+// instance blocks can resolve to a type name + field layout.
+static StructTable collect_structs(const J &blocks) {
+    StructTable structs;
+    for (const J &block : blocks["blocks"]) {
+        if (node_type(block) != "struct_def") continue;
+        if (!block.contains("id")) continue;
+        std::string id = structIdOf(block["id"].get<std::string>());
+        StructInfo si;
+        si.name = fstr(block, "NAME");
+        const J *f = child(block, "FIELDS");
+        while (f) {
+            if (node_type(*f) == "struct_field")
+                si.fields.push_back({ fstr(*f, "FNAME"), fstr(*f, "FTYPE") });
+            f = (f->contains("next") && (*f)["next"].is_object() && (*f)["next"].contains("block"))
+                ? &(*f)["next"]["block"] : nullptr;
+        }
+        structs[id] = si;
+    }
+    return structs;
 }
 
 /* ------------------------------------------------------------------ *
@@ -955,9 +1195,29 @@ static std::string cppize(const J &json, const std::string &main_fn_name, const 
     if (!blocks.contains("blocks") || !blocks["blocks"].is_array())
         throw std::runtime_error("blocks.blocks must be an array");
 
+    const FuncTable funcs = collect_funcs(blocks);
+    const StructTable structs = collect_structs(blocks);
+
     std::string out = B.prelude();
-    for (const J &block : blocks["blocks"])
-        out += dfs(block, main_fn_name, B).code + "\n\n";
+    // Emit struct definitions first so functions can reference the types.
+    for (const J &block : blocks["blocks"]) {
+        if (node_type(block) == "struct_def")
+            out += dfs(block, main_fn_name, funcs, structs, B).code + "\n\n";
+    }
+    // Then custom function definitions so C++ sees them before main uses
+    // them (no forward declarations needed for the common case).
+    for (const J &block : blocks["blocks"]) {
+        if (node_type(block) == "custom_func_def")
+            out += dfs(block, main_fn_name, funcs, structs, B).code + "\n\n";
+    }
+    // Then main (and legacy wasm_func_def roots). Orphan top-level blocks that
+    // live outside a function are ignored.
+    for (const J &block : blocks["blocks"]) {
+        const std::string t = node_type(block);
+        if (t != "wasm_func_main" && !starts_with(t, "wasm_func_def_"))
+            continue;
+        out += dfs(block, main_fn_name, funcs, structs, B).code + "\n\n";
+    }
     return strip(out);
 }
 

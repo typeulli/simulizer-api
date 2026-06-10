@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <utility>
+#include <unordered_map>
 #if defined(_WIN32)
 #  include <windows.h>
 #else
@@ -58,10 +61,12 @@ enum VarType {
     TY_I32_VEC, TY_F64_VEC,
     TY_VEC2, TY_VEC3,
     TY_TENSOR, TY_BD2, TY_BD3,
+    TY_STRUCT,
     TY_UNKNOWN
 };
 
-struct Var { char name[256]; VarType type; };
+// For TY_STRUCT vars, `sname` holds the user-struct type name (else empty).
+struct Var { char name[256]; VarType type; char sname[128]; };
 static const int MAX_VARS = 1024;
 static Var g_vars[MAX_VARS];
 static int g_nv = 0;
@@ -71,6 +76,7 @@ static void sym_set(const char *n, VarType t) {
         if (!strcmp(g_vars[i].name, n)) { g_vars[i].type = t; return; }
     if (g_nv < MAX_VARS) {
         strncpy(g_vars[g_nv].name, n, 255);
+        g_vars[g_nv].sname[0] = '\0';
         g_vars[g_nv++].type = t;
     }
 }
@@ -78,6 +84,24 @@ static VarType sym_get(const char *n) {
     for (int i = 0; i < g_nv; i++)
         if (!strcmp(g_vars[i].name, n)) return g_vars[i].type;
     return TY_UNKNOWN;
+}
+static void sym_set_struct(const char *n, const char *sname) {
+    for (int i = 0; i < g_nv; i++)
+        if (!strcmp(g_vars[i].name, n)) {
+            g_vars[i].type = TY_STRUCT;
+            strncpy(g_vars[i].sname, sname, 127);
+            return;
+        }
+    if (g_nv < MAX_VARS) {
+        strncpy(g_vars[g_nv].name, n, 255);
+        strncpy(g_vars[g_nv].sname, sname, 127);
+        g_vars[g_nv++].type = TY_STRUCT;
+    }
+}
+static const char *sym_get_struct(const char *n) {
+    for (int i = 0; i < g_nv; i++)
+        if (!strcmp(g_vars[i].name, n)) return g_vars[i].sname;
+    return "";
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -270,6 +294,14 @@ static string unop_tok(CXCursor c, CXTranslationUnit tu, CXCursor child) {
     return op.empty() ? "?" : op;
 }
 
+// User-defined structs, collected in a pre-pass (definition below near the other
+// pre-pass collectors). Declared here so cx_vartype can resolve struct types.
+struct UserStruct {
+    string blockId;                                   // the def block's Blockly id
+    std::vector<std::pair<string, string>> fields;    // (name, "i32"|"f64")
+};
+static std::unordered_map<string, UserStruct> g_user_structs;  // key = struct name
+
 static VarType cx_vartype(CXType t) {
     CXType canon = clang_getCanonicalType(t);
     if (canon.kind != CXType_Invalid && canon.kind != CXType_Unexposed)
@@ -296,6 +328,13 @@ static VarType cx_vartype(CXType t) {
         if (sp.find("Tensor")    != string::npos) return TY_TENSOR;
         if (sp.find("Boundary2D")!= string::npos) return TY_BD2;
         if (sp.find("Boundary3D")!= string::npos) return TY_BD3;
+        // user-defined struct?
+        {
+            string nm = sp;
+            if (nm.rfind("struct ", 0) == 0) nm = nm.substr(7);
+            else if (nm.rfind("class ", 0) == 0) nm = nm.substr(6);
+            if (g_user_structs.count(nm)) return TY_STRUCT;
+        }
         return TY_UNKNOWN;
     }
     }
@@ -310,6 +349,57 @@ static CXCursor unwrap(CXCursor c) {
         break;
     }
     return c;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   User-defined custom functions
+   ═══════════════════════════════════════════════════════════════════ */
+
+// Collected (in a pre-pass) so that a CallExpr can resolve to the call block
+// type `custom_func_<funcId>` and the definition block carries the same id.
+struct UserFunc {
+    string blockId;                              // the def block's Blockly id
+    string ret;                                  // "i32" | "f64" | "void"
+    std::vector<std::pair<string, string>> params;  // (name, "i32"|"f64")
+};
+static std::unordered_map<string, UserFunc> g_user_funcs;
+
+// Mirrors funcIdOf() in the frontend / block2cpp: non-alphanumerics → '_'.
+static string funcIdOf2(const string &id) {
+    string out = "f";
+    for (char ch : id) {
+        bool alnum = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+        out += alnum ? ch : '_';
+    }
+    return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   User-defined structs (helpers; the table itself is declared earlier so
+   cx_vartype can resolve struct types)
+   ═══════════════════════════════════════════════════════════════════ */
+
+// Mirrors structIdOf() in the frontend / block2cpp: 's' + sanitized id.
+static string structIdOf2(const string &id) {
+    string out = "s";
+    for (char ch : id) {
+        bool alnum = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+        out += alnum ? ch : '_';
+    }
+    return out;
+}
+
+// If `t` names a user-defined struct (one collected from the main file), returns
+// its name; otherwise "". simstd records (vec2, Tensor, …) live in simstd.hpp, so
+// they are never in g_user_structs and fall through.
+static string user_struct_name(CXType t) {
+    CXType canon = clang_getCanonicalType(t);
+    if (canon.kind != CXType_Invalid && canon.kind != CXType_Unexposed) t = canon;
+    if (t.kind != CXType_Record) return "";
+    string sp = cx_str(clang_getTypeSpelling(t));
+    if (sp.rfind("struct ", 0) == 0) sp = sp.substr(7);
+    else if (sp.rfind("class ", 0) == 0) sp = sp.substr(6);
+    return g_user_structs.count(sp) ? sp : "";
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -334,6 +424,40 @@ static string make_block(const char *type, const char *flds, const char *inps) {
 static string expr_json(CXCursor c, CXTranslationUnit tu);
 static string stmt_json(CXCursor c, CXTranslationUnit tu);
 static string body_json(CXCursor compound, CXTranslationUnit tu);
+
+// For a struct VarDecl, return the real initializer expression (a function call
+// `Pair p = makePair();` or copy `Pair p = q;`), or a null cursor for plain
+// default construction `Pair p;` (which must not produce an INIT input).
+static CXCursor struct_init_expr(CXCursor varDecl) {
+    // A constructor call (default/copy construction) is exposed as a CallExpr
+    // whose spelling is the struct's own type name — that is NOT a real init.
+    auto is_ctor = [](CXCursor cc) {
+        if (cc.kind != CXCursor_CallExpr) return false;
+        return g_user_structs.count(cx_str(clang_getCursorSpelling(cc))) > 0;
+    };
+    auto is_init = [&](CXCursor cc) {
+        return cc.kind == CXCursor_DeclRefExpr || (cc.kind == CXCursor_CallExpr && !is_ctor(cc));
+    };
+    Kids k = get_kids(varDecl);
+    for (int i = k.n - 1; i >= 0; i--) {
+        auto knd = k.c[i].kind;
+        if (knd == CXCursor_TypeRef || knd == CXCursor_NamespaceRef || knd == CXCursor_TemplateRef)
+            continue;
+        // libclang does not expose CXXConstructExpr as a distinct kind; a real
+        // initializer surfaces as a CallExpr (`= makePair()`) or DeclRefExpr
+        // (`= other`), possibly wrapped in the copy constructor's CallExpr.
+        // Plain default construction `Pair p;` yields only the ctor call (no
+        // inner init), so we return a null cursor (no INIT input).
+        CXCursor u = unwrap(k.c[i]);
+        if (is_init(u)) return u;
+        Kids ck = get_kids(u);
+        for (int j = 0; j < ck.n; j++) {
+            CXCursor cu = unwrap(ck.c[j]);
+            if (is_init(cu)) return cu;
+        }
+    }
+    return clang_getNullCursor();
+}
 
 static CXCursor find_init_list(CXCursor c, int depth = 0) {
     if (depth > 12) return clang_getNullCursor();
@@ -416,6 +540,13 @@ static string expr_json(CXCursor c, CXTranslationUnit tu) {
     case CXCursor_DeclRefExpr: {
         string name = cx_str(clang_getCursorSpelling(c));
         VarType t = sym_get(name.c_str());
+        if (t == TY_STRUCT) {
+            auto it = g_user_structs.find(sym_get_struct(name.c_str()));
+            if (it != g_user_structs.end()) {
+                string type = "struct_" + structIdOf2(it->second.blockId) + "_ref";
+                return make_block(type.c_str(), fmt("\"VAR\":\"%s\"", name.c_str()).c_str(), nullptr);
+            }
+        }
         string fld = fmt("\"NAME\":\"%s\"", name.c_str());
         if (t == TY_I32 || t == TY_BOOL)   return make_block("local_get_i32",      fld.c_str(), nullptr);
         if (t == TY_F64)                   return make_block("local_get_f64",      fld.c_str(), nullptr);
@@ -571,6 +702,22 @@ static string expr_json(CXCursor c, CXTranslationUnit tu) {
         Kids k = get_kids(c);
         int a = 1; /* first arg index */
 
+        // Struct constructor (copy/default), e.g. an implicit `Pair(r)` wrapping
+        // a `return r;` or `Pair p = q;`. Pass through to the source value:
+        // a struct variable ref, or a user-function call returning the struct.
+        if (g_user_structs.count(fname)) {
+            for (int i = 0; i < k.n; i++) {
+                CXCursor u = unwrap(k.c[i]);
+                if (u.kind == CXCursor_DeclRefExpr &&
+                    sym_get(cx_str(clang_getCursorSpelling(u)).c_str()) == TY_STRUCT)
+                    return expr_json(u, tu);
+                if (u.kind == CXCursor_CallExpr &&
+                    g_user_funcs.count(cx_str(clang_getCursorSpelling(u))))
+                    return expr_json(u, tu);
+            }
+            return default_const_for(c);
+        }
+
         auto wrap1 = [&](int i) { return wrap_block(expr_json(k.c[i], tu)); };
         auto wrap2 = [&](int i, int j) {
             return fmt("\"A\":%s,\"B\":%s",
@@ -613,6 +760,22 @@ static string expr_json(CXCursor c, CXTranslationUnit tu) {
         }
         if (fname == "debug_series")
             return make_block("debug_series", nullptr, nullptr);
+        if (fname == "sim_rand_int") {
+            string inps = fmt("\"MIN\":%s,\"MAX\":%s",
+                              wrap1(a).c_str(), wrap1(a+1).c_str());
+            return make_block("i32_random", nullptr, inps.c_str());
+        }
+        if (fname == "sim_rand_range") {
+            string inps = fmt("\"MIN\":%s,\"MAX\":%s",
+                              wrap1(a).c_str(), wrap1(a+1).c_str());
+            return make_block("f64_random_range", nullptr, inps.c_str());
+        }
+        if (fname == "sim_rand")
+            return make_block("f64_random", nullptr, nullptr);
+        if (fname == "sim_input_int")
+            return make_block("input_i32", nullptr, nullptr);
+        if (fname == "sim_input_float")
+            return make_block("input_f64", nullptr, nullptr);
         if (fname == "__builtin_clz") {
             string inps = fmt("\"VALUE\":%s", wrap1(a).c_str());
             return make_block("i32_unop", "\"OP\":\"clz\"", inps.c_str());
@@ -686,6 +849,10 @@ static string expr_json(CXCursor c, CXTranslationUnit tu) {
             string inps = fmt("\"M\":%s", wrap1(a).c_str());
             return make_block(fname.c_str(), nullptr, inps.c_str());
         }
+        if (fname=="tensor_grad"||fname=="tensor_curl"||fname=="tensor_lapl") {
+            string inps = fmt("\"TENSOR\":%s", wrap1(a).c_str());
+            return make_block(fname.c_str(), nullptr, inps.c_str());
+        }
         if (fname == "size" && k.n >= 1) {
             Kids mk = get_kids(k.c[0]);
             CXCursor arr_c = (mk.n > 0) ? mk.c[0] : k.c[0];
@@ -694,6 +861,22 @@ static string expr_json(CXCursor c, CXTranslationUnit tu) {
                               wrap_block(expr_json(arr_c, tu)).c_str());
             return make_block(at==TY_F64_VEC?"array_len_f64":"array_len_i32",
                               nullptr, inps.c_str());
+        }
+        // user-defined custom function call → custom_func_<funcId>
+        {
+            auto uit = g_user_funcs.find(fname);
+            if (uit != g_user_funcs.end()) {
+                const UserFunc &uf = uit->second;
+                string inps;
+                int np = (int)uf.params.size();
+                for (int i = 0; i < np && (a + i) < k.n; i++) {
+                    if (!inps.empty()) inps += ",";
+                    inps += fmt("\"ARG%d\":%s", i,
+                                wrap_block(expr_json(k.c[a + i], tu)).c_str());
+                }
+                string type = "custom_func_" + funcIdOf2(uf.blockId);
+                return make_block(type.c_str(), nullptr, inps.empty() ? nullptr : inps.c_str());
+            }
         }
         return default_const_for(c);
     }
@@ -713,6 +896,15 @@ static string expr_json(CXCursor c, CXTranslationUnit tu) {
                 return make_block(bt==TY_VEC2?"vec2_y":"vec3_y", nullptr, inps.c_str());
             if (bt==TY_VEC3 && member=="z")
                 return make_block("vec3_z", nullptr, inps.c_str());
+            if (bt == TY_STRUCT) {
+                string bn = cx_str(clang_getCursorSpelling(unwrap(base)));
+                auto it = g_user_structs.find(sym_get_struct(bn.c_str()));
+                if (it != g_user_structs.end()) {
+                    string type = "struct_" + structIdOf2(it->second.blockId) + "_get";
+                    string fld = fmt("\"VAR\":\"%s\",\"FIELD\":\"%s\"", bn.c_str(), member.c_str());
+                    return make_block(type.c_str(), fld.c_str(), nullptr);
+                }
+            }
         }
         return default_const_for(c);
     }
@@ -960,6 +1152,21 @@ static string stmt_json(CXCursor c, CXTranslationUnit tu) {
         }
         if (vt == TY_BD2) return make_block("local_decl_bd2", fld.c_str(), nullptr);
         if (vt == TY_BD3) return make_block("local_decl_bd3", fld.c_str(), nullptr);
+        if (vt == TY_STRUCT) {
+            string sn = user_struct_name(clang_getCursorType(c));
+            auto it = g_user_structs.find(sn);
+            if (it != g_user_structs.end()) {
+                sym_set_struct(name.c_str(), sn.c_str());
+                string type = "struct_" + structIdOf2(it->second.blockId) + "_decl";
+                string fldv = fmt("\"VAR\":\"%s\"", name.c_str());
+                CXCursor init_c = struct_init_expr(c);
+                if (!clang_Cursor_isNull(init_c)) {
+                    string inps = fmt("\"INIT\":%s", wrap_block(expr_json(init_c, tu)).c_str());
+                    return make_block(type.c_str(), fldv.c_str(), inps.c_str());
+                }
+                return make_block(type.c_str(), fldv.c_str(), nullptr);
+            }
+        }
         return make_block("i32_const", "\"VALUE\":0", nullptr);
     }
 
@@ -1100,6 +1307,8 @@ static string stmt_json(CXCursor c, CXTranslationUnit tu) {
         string vj = expr_json(k.c[0], tu);
         VarType t = cx_vartype(clang_getCursorType(unwrap(k.c[0])));
         string inps = fmt("\"VALUE\":%s", wrap_block(vj).c_str());
+        if (t == TY_STRUCT)
+            return make_block("wasm_return_struct", nullptr, inps.c_str());
         return make_block(t==TY_F64?"wasm_return_f64":"wasm_return_i32",
                           nullptr, inps.c_str());
     }
@@ -1215,6 +1424,20 @@ static string stmt_json(CXCursor c, CXTranslationUnit tu) {
                     const char *btype = (vt == TY_VEC2) ? "vec2_component_set" : "vec3_component_set";
                     return make_block(btype, fld.c_str(), inps.c_str());
                 }
+                if (vt == TY_STRUCT) {
+                    auto it = g_user_structs.find(sym_get_struct(obj_name.c_str()));
+                    if (it != g_user_structs.end()) {
+                        string ftype = "i32";
+                        for (auto &f : it->second.fields)
+                            if (f.first == member) { ftype = f.second; break; }
+                        string rhs_j = expr_json(rhs, tu);
+                        if (ftype == "f64") rhs_j = coerce_f64(rhs_j, rhs);
+                        string type = "struct_" + structIdOf2(it->second.blockId) + "_set";
+                        string fld = fmt("\"VAR\":\"%s\",\"FIELD\":\"%s\"", obj_name.c_str(), member.c_str());
+                        string inps = fmt("\"VALUE\":%s", wrap_block(rhs_j).c_str());
+                        return make_block(type.c_str(), fld.c_str(), inps.c_str());
+                    }
+                }
             }
         }
         if (lhs.kind == CXCursor_DeclRefExpr) {
@@ -1252,19 +1475,114 @@ struct TopCtx {
     bool first = true;
 };
 
+// Maps a function's libclang return type to a block return-type tag.
+static string func_ret_tag(CXCursor c) {
+    CXType ret = clang_getResultType(clang_getCursorType(c));
+    if (ret.kind == CXType_Void) return "void";
+    string sn = user_struct_name(ret);
+    if (!sn.empty()) {
+        auto it = g_user_structs.find(sn);
+        if (it != g_user_structs.end()) return "struct_" + structIdOf2(it->second.blockId);
+    }
+    VarType rvt = cx_vartype(ret);
+    return rvt == TY_F64 ? "f64" : "i32";
+}
+
+// Pre-pass: register every user-defined struct *definition* so VarDecls / member
+// access / returns resolve before any body is emitted.
+static enum CXChildVisitResult collect_structs_v(CXCursor c, CXCursor, CXClientData) {
+    if ((c.kind != CXCursor_StructDecl && c.kind != CXCursor_ClassDecl) ||
+        !clang_isCursorDefinition(c))
+        return CXChildVisit_Continue;
+    if (!clang_Location_isFromMainFile(clang_getCursorLocation(c)))
+        return CXChildVisit_Continue;
+    string name = cx_str(clang_getCursorSpelling(c));
+    if (name.empty() || g_user_structs.count(name)) return CXChildVisit_Continue;
+    UserStruct us;
+    us.blockId = new_id();
+    Kids k = get_kids(c);
+    for (int i = 0; i < k.n; i++) {
+        if (k.c[i].kind == CXCursor_FieldDecl) {
+            string fn = cx_str(clang_getCursorSpelling(k.c[i]));
+            VarType ft = cx_vartype(clang_getCursorType(k.c[i]));
+            us.fields.push_back({ fn, ft == TY_F64 ? "f64" : "i32" });
+        }
+    }
+    g_user_structs[name] = us;
+    return CXChildVisit_Continue;
+}
+
+// Pre-pass: register every user-defined function *definition* (not main) so its
+// id/name/params are known before bodies (and their calls) are emitted.
+static enum CXChildVisitResult collect_funcs_v(CXCursor c, CXCursor, CXClientData) {
+    if (c.kind != CXCursor_FunctionDecl || !clang_isCursorDefinition(c))
+        return CXChildVisit_Continue;
+    // Only the user's own source — never the inline functions in simstd.hpp.
+    if (!clang_Location_isFromMainFile(clang_getCursorLocation(c)))
+        return CXChildVisit_Continue;
+    string name = cx_str(clang_getCursorSpelling(c));
+    if (name == "main" || g_user_funcs.count(name)) return CXChildVisit_Continue;
+    UserFunc uf;
+    uf.blockId = new_id();
+    uf.ret = func_ret_tag(c);
+    Kids k = get_kids(c);
+    for (int i = 0; i < k.n; i++) {
+        if (k.c[i].kind == CXCursor_ParmDecl) {
+            string pn = cx_str(clang_getCursorSpelling(k.c[i]));
+            string psn = user_struct_name(clang_getCursorType(k.c[i]));
+            if (!psn.empty()) {
+                uf.params.push_back({ pn, "struct_" + structIdOf2(g_user_structs[psn].blockId) });
+            } else {
+                VarType pt = cx_vartype(clang_getCursorType(k.c[i]));
+                uf.params.push_back({ pn, pt == TY_F64 ? "f64" : "i32" });
+            }
+        }
+    }
+    g_user_funcs[name] = uf;
+    return CXChildVisit_Continue;
+}
+
 static enum CXChildVisitResult visit_top(CXCursor c, CXCursor, CXClientData data) {
     TopCtx *ctx = static_cast<TopCtx*>(data);
+
+    // Only the user's own source — never the declarations in simstd.hpp.
+    if (!clang_Location_isFromMainFile(clang_getCursorLocation(c)))
+        return CXChildVisit_Continue;
+
+    // Struct definition → struct_def block with a FIELDS stack of struct_field.
+    if ((c.kind == CXCursor_StructDecl || c.kind == CXCursor_ClassDecl) &&
+        clang_isCursorDefinition(c)) {
+        string sname = cx_str(clang_getCursorSpelling(c));
+        auto it = g_user_structs.find(sname);
+        if (it == g_user_structs.end()) return CXChildVisit_Continue;
+        const UserStruct &us = it->second;
+        const int nf = (int)us.fields.size();
+        string fields_chain = "{}";
+        if (nf > 0) {
+            string *fblocks = new string[nf];
+            for (int i = 0; i < nf; i++) {
+                string flds = fmt("\"FNAME\":\"%s\",\"FTYPE\":\"%s\"",
+                                  us.fields[i].first.c_str(), us.fields[i].second.c_str());
+                fblocks[i] = make_block("struct_field", flds.c_str(), nullptr);
+            }
+            fields_chain = chain_next(fblocks, nf);
+            delete[] fblocks;
+        }
+        string blk = fmt("{\"type\":\"struct_def\",\"id\":\"%s\",\"x\":40,\"y\":40,"
+                         "\"fields\":{\"NAME\":\"%s\"}",
+                         us.blockId.c_str(), sname.c_str());
+        if (fields_chain != "{}" && !fields_chain.empty())
+            blk += fmt(",\"inputs\":{\"FIELDS\":%s}", wrap_block(fields_chain).c_str());
+        blk += "}";
+        if (!ctx->first) ctx->out += ",";
+        ctx->out += blk;
+        ctx->first = false;
+        return CXChildVisit_Continue;
+    }
+
     if (c.kind != CXCursor_FunctionDecl) return CXChildVisit_Continue;
 
     string name = cx_str(clang_getCursorSpelling(c));
-    if (name != "main") return CXChildVisit_Continue;
-
-    CXType ret = clang_getResultType(clang_getCursorType(c));
-    VarType rvt = cx_vartype(ret);
-    const char *ret_str =
-        (ret.kind == CXType_Void) ? "void" :
-        (rvt == TY_F64)           ? "f64"  :
-        (rvt == TY_BOOL)          ? "bool" : "i32";
 
     Kids k = get_kids(c);
     CXCursor body = clang_getNullCursor();
@@ -1275,13 +1593,45 @@ static enum CXChildVisitResult visit_top(CXCursor c, CXCursor, CXClientData data
         }
     }
 
-    string blk = fmt("{\"type\":\"wasm_func_main\",\"id\":\"%s\","
-                     "\"x\":40,\"y\":40,\"fields\":{\"RET_TYPE\":\"%s\"}",
-                     new_id().c_str(), ret_str);
-    if (has_body)
-        blk += fmt(",\"inputs\":{\"BODY\":%s}",
+    string blk;
+    if (name == "main") {
+        CXType ret = clang_getResultType(clang_getCursorType(c));
+        VarType rvt = cx_vartype(ret);
+        const char *ret_str =
+            (ret.kind == CXType_Void) ? "void" :
+            (rvt == TY_F64)           ? "f64"  :
+            (rvt == TY_BOOL)          ? "bool" : "i32";
+        blk = fmt("{\"type\":\"wasm_func_main\",\"id\":\"%s\","
+                  "\"x\":40,\"y\":40,\"fields\":{\"RET_TYPE\":\"%s\"}",
+                  new_id().c_str(), ret_str);
+        if (has_body)
+            blk += fmt(",\"inputs\":{\"BODY\":%s}",
+                       wrap_block(body_json(body, ctx->tu)).c_str());
+        blk += "}";
+    } else {
+        // User-defined custom function → custom_func_def block (uses the id
+        // assigned in the collect pass so its calls line up).
+        auto it = g_user_funcs.find(name);
+        if (it == g_user_funcs.end() || !has_body) return CXChildVisit_Continue;
+        const UserFunc &uf = it->second;
+        // Register struct parameters so member access in the body (`p.field`)
+        // resolves to struct get/set blocks rather than a plain local.
+        for (int i = 0; i < k.n; i++) {
+            if (k.c[i].kind != CXCursor_ParmDecl) continue;
+            string psn = user_struct_name(clang_getCursorType(k.c[i]));
+            if (!psn.empty())
+                sym_set_struct(cx_str(clang_getCursorSpelling(k.c[i])).c_str(), psn.c_str());
+        }
+        string fields = fmt("\"NAME\":\"%s\",\"RET\":\"%s\"", name.c_str(), uf.ret.c_str());
+        for (int i = 0; i < (int)uf.params.size(); i++)
+            fields += fmt(",\"PNAME%d\":\"%s\",\"PTYPE%d\":\"%s\"",
+                          i, uf.params[i].first.c_str(), i, uf.params[i].second.c_str());
+        blk = fmt("{\"type\":\"custom_func_def\",\"id\":\"%s\",\"x\":40,\"y\":40,"
+                  "\"extraState\":{\"paramCount\":%d},\"fields\":{%s}",
+                  uf.blockId.c_str(), (int)uf.params.size(), fields.c_str());
+        blk += fmt(",\"inputs\":{\"BODY\":%s}}",
                    wrap_block(body_json(body, ctx->tu)).c_str());
-    blk += "}";
+    }
 
     if (!ctx->first) ctx->out += ",";
     ctx->out += blk;
@@ -1407,6 +1757,10 @@ int main(int /*argc*/, char ** /*argv*/) {
     TopCtx ctx;
     ctx.tu = tu;
 
+    // First collect user-defined structs (so types resolve) and functions (so
+    // their calls resolve), then emit.
+    clang_visitChildren(clang_getTranslationUnitCursor(tu), collect_structs_v, nullptr);
+    clang_visitChildren(clang_getTranslationUnitCursor(tu), collect_funcs_v, nullptr);
     clang_visitChildren(clang_getTranslationUnitCursor(tu), visit_top, &ctx);
 
     for (int i = 0; i < g_nreg; i++) {

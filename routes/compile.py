@@ -814,6 +814,23 @@ def emcc(body: EmccRequest):
 
         wasm_file = out_dir / "user.wasm"
 
+        # If the program reads interactive input (sim_input_*), build with
+        # Asyncify so those host imports can suspend the run until the UI
+        # supplies a value (same machinery as the debugger); malloc/free are
+        # exported so the worker can allocate the Asyncify stack. Only the user's
+        # own sources are scanned — simstd.hpp lives in system_dir, not here.
+        uses_input = any(
+            "sim_input" in p.read_text(encoding="utf-8", errors="ignore")
+            for p in project_root.rglob("*")
+            if p.suffix in (".cpp", ".hpp", ".h", ".cc", ".cxx")
+        )
+        exported = ("['___sim_worker_entry','_malloc','_free']"
+                    if uses_input else "['___sim_worker_entry']")
+        asyncify_flags = (
+            ["-sASYNCIFY=1", "-sASYNCIFY_IMPORTS=['__sim_input_i32','__sim_input_f64']"]
+            if uses_input else []
+        )
+
         # Standalone WASM: libc/libc++ statically linked into the module,
         # only `env` (our __sim_* bridges) and `wasi_snapshot_preview1` imports
         # need to be supplied by the worker at instantiate time.
@@ -828,7 +845,8 @@ def emcc(body: EmccRequest):
             *flags.define_flags,
             "-sSTANDALONE_WASM=1",
             "-sERROR_ON_UNDEFINED_SYMBOLS=0",
-            "-sEXPORTED_FUNCTIONS=['___sim_worker_entry']",
+            *asyncify_flags,
+            f"-sEXPORTED_FUNCTIONS={exported}",
             "-fno-exceptions",
             # Build a WASI *reactor* (no main/_start): the worker calls
             # __sim_worker_entry directly, so we just need `_initialize` to run
@@ -937,6 +955,86 @@ def emcc_debug(body: EmccRequest):
 
         wasm_b64 = base64.b64encode(wasm_file.read_bytes()).decode("ascii")
         return {"wasm": wasm_b64, "sidecar": sidecar}
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+class EmccBlockRequest(BaseModel):
+    # Legacy Blockly JSON (same shape the /build lang="blocks" path consumes).
+    code: str
+
+
+@router.post("/emcc/blocks")
+def emcc_blocks(body: EmccBlockRequest):
+    """Interactive run path for Block programs that contain input blocks.
+
+    Transpiles the blocks to C++ (cppize → worker()) and builds an Asyncify-
+    enabled standalone WASM whose sim_input_int()/sim_input_float() suspend via
+    the __sim_input_* host imports, so the worker can pause for user input and
+    resume. Returns raw wasm, like /compile/emcc."""
+    flags = _resolve_flags(_compile_options_from_tree(None))
+    file_uuid = str(uuid.uuid4())
+    out_dir = path_temp / file_uuid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        project_root = out_dir / "project"
+        project_root.mkdir(parents=True, exist_ok=True)
+        system_dir = out_dir / "_system"
+        system_dir.mkdir(parents=True, exist_ok=True)
+        _stage_build_system(system_dir)
+
+        try:
+            cpp_code = cppize(body.code, "worker")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        # Same worker-entry shim as /compile/emcc (provides __sim_worker_entry
+        # calling worker()); the cppize output already #includes "simstd.hpp".
+        cpp_file = project_root / "output.cpp"
+        cpp_file.write_text(
+            '#include <iostream>\n' + cpp_code + _WORKER_ENTRY_SHIM,
+            encoding="utf-8",
+        )
+
+        wasm_file = out_dir / "user.wasm"
+
+        # Standalone wasm (see /compile/emcc) + ASYNCIFY so the input host
+        # imports can unwind/rewind, and malloc/free exported so the worker can
+        # allocate the Asyncify stack region.
+        EMCC_COMMAND = [
+            "em++",
+            str(cpp_file),
+            flags.std_flag,
+            "-o", str(wasm_file),
+            f"-I{system_dir}",
+            f"-I{project_root}",
+            flags.opt_flag,
+            *flags.define_flags,
+            "-sSTANDALONE_WASM=1",
+            "-sERROR_ON_UNDEFINED_SYMBOLS=0",
+            "-sASYNCIFY=1",
+            "-sASYNCIFY_IMPORTS=['__sim_input_i32','__sim_input_f64']",
+            "-sEXPORTED_FUNCTIONS=['___sim_worker_entry','_malloc','_free']",
+            "-fno-exceptions",
+            "--no-entry",
+            "-Wl,--allow-undefined",
+        ]
+
+        # shell=True for the same reason as /compile/emcc (em++ is a launcher
+        # script); every interpolated token is server-generated or validated.
+        proc = subprocess.run(
+            EMCC_COMMAND,
+            capture_output=True,
+            text=True,
+            shell=True,
+        )
+        if proc.returncode != 0:
+            raise HTTPException(status_code=422, detail=proc.stderr)
+
+        return Response(
+            content=wasm_file.read_bytes(),
+            media_type="application/wasm",
+        )
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
