@@ -17,6 +17,7 @@ from pathlib import Path
 from routes.compile import router as compile_router
 from routes.lsp import router as lsp_router
 from routes.lsp import warm_clangd_pool, shutdown_clangd_pool, sweep_stale_sessions
+from routes.agent import router as agent_router
 
 
 #asdf
@@ -61,6 +62,7 @@ app.add_middleware(
 
 app.include_router(compile_router)
 app.include_router(lsp_router)
+app.include_router(agent_router)
 
 @app.head("/health")
 def health():
@@ -151,4 +153,4 @@ def chat(body: ChatRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api:app", reload=True, host="0.0.0.0", port=6000, proxy_headers=True, forwarded_allow_ips="*")
+    uvicorn.run("api:app", reload=True, host="0.0.0.0", port=7000, proxy_headers=True, forwarded_allow_ips="*")

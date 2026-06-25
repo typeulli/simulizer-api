@@ -57,6 +57,8 @@ class CompileOptions(BaseModel):
     std: str = "c++17"
     defines: list[str] = []
     icon: str = ""                     # relative .ico path (compile.icon); Build+Windows only
+    alone: bool = False                # build.alone: standalone SSE+browser .exe vs
+                                       # client-driven shared-memory .sim (default)
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,10 @@ def _resolve_flags(opts: CompileOptions) -> ResolvedFlags:
         if not isinstance(d, str) or not _DEFINE_RE.match(d):
             raise HTTPException(status_code=400, detail=f"Invalid define: {d!r}")
         define_flags.append(f"-D{d}")
+    if opts.alone:
+        # Standalone build: simstd.hpp serves the SSE console + opens a browser
+        # instead of writing to shared memory.
+        define_flags.append("-DSIMULIZER_ALONE")
     return ResolvedFlags(std_flag=f"-std={opts.std}", opt_flag=f"-{opts.optimization}", define_flags=define_flags)
 
 
@@ -128,6 +134,8 @@ def _compile_options_from_tree(tree: Optional[list]) -> CompileOptions:
         opts.system = build["system"]
     if isinstance(build.get("icon"), str):
         opts.icon = build["icon"].strip()
+    if isinstance(build.get("alone"), bool):
+        opts.alone = build["alone"]
     if isinstance(comp.get("optimization"), str) and comp["optimization"] in _OPT_LEVELS:
         opts.optimization = comp["optimization"]
     if isinstance(comp.get("std"), str) and comp["std"] in _STDS:
@@ -149,6 +157,7 @@ _BUILD_SYSTEM_FILES = [
     (path_here / "simstd.hpp",            "simstd.hpp"),
     (path_here / "lib" / "banner.hpp",    "lib/banner.hpp"),
     (path_here / "lib" / "httplib.h",     "lib/httplib.h"),
+    (path_here / "lib" / "sim_shm.hpp",   "lib/sim_shm.hpp"),
 ]
 
 
@@ -288,7 +297,9 @@ def _build_argv(os_key: str, *, cpp_file: Path, exe_file: Path, system_dir: Path
         "-v",
     ]
     if os_key == "linux":
-        inner = ["g++", *common, "-static-libgcc", "-static-libstdc++"]
+        # -lrt: POSIX shm_open/mmap for the shared-memory output mirror
+        # (lib/sim_shm.hpp); harmless on glibc >=2.34 where it folded into libc.
+        inner = ["g++", *common, "-lrt", "-static-libgcc", "-static-libstdc++"]
         image = LINUX_BUILD_IMAGE
     else:  # macos
         inner = [MACOS_GXX, *common]
@@ -663,11 +674,13 @@ int main() {
     simulizer::init();
     std::thread t([]() {
         worker();
+#ifdef SIMULIZER_ALONE
         std::cout << "\\nPress enter to exit..." << std::flush;
         std::cin.get();
         simulizer::svr.stop();
+#endif
     });
-    simulizer::svr.listen("localhost", 8080);
+    simulizer::serve();   // alone: serve SSE (blocks until stop); else: returns now
     t.join();
     return 0;
 }
@@ -689,6 +702,11 @@ def build(body: BuildRequest, request: Request, system: Optional[str] = None):
         requested_system = opts.system
     os_key = _resolve_target_os(requested_system, request.headers.get("user-agent", ""))
     target = TARGETS[os_key]
+    if not opts.alone:
+        # Client-driven build: ship as output.sim — a renamed native executable
+        # the Simulizer desktop client launches as a subprocess and reads over
+        # shared memory. The on-disk out_name (what `-o` produced) is unchanged.
+        target = BuildTarget(target.key, target.out_name, "output.sim")
 
     file_uuid = str(uuid.uuid4())
     out_dir = path_temp / file_uuid

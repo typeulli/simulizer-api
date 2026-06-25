@@ -339,8 +339,10 @@ inline void graph_arr_range_f64(const std::vector<f64>& arr, f64 mn, f64 mx) {
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <cstdlib>
 #include "lib/httplib.h"
 #include "lib/banner.hpp"
+#include "lib/sim_shm.hpp"  // Windows-only shared-memory output mirror (no-op elsewhere)
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -457,12 +459,34 @@ std::shared_mutex queue_mutex;
 std::condition_variable_any queue_cv;
 httplib::Server svr;
 
+// Process-wide writer that mirrors every push_message() into shared memory so a
+// same-machine consumer (the client/ desktop app) can display the same stream.
+// Cross-platform: Windows file mapping, POSIX shm_open (see lib/sim_shm.hpp).
+inline shm::Writer& shm_writer() {
+    static shm::Writer w;
+    return w;
+}
+
+// Port the standalone HTTP server bound to (0 until init() picks one). Only
+// meaningful in SIMULIZER_ALONE builds.
+inline int& server_port() {
+    static int p = 0;
+    return p;
+}
+
+// Two mutually-exclusive build modes (selected at compile time):
+//   SIMULIZER_ALONE  → feed the in-memory queue that the SSE /events server drains.
+//   (default)        → mirror straight into the shared-memory ring for the client.
 inline void push_message(const std::string& msg) {
+#ifdef SIMULIZER_ALONE
     {
         std::unique_lock<std::shared_mutex> lock(queue_mutex);
         message_queue.push_back(msg);
     }
     queue_cv.notify_all();
+#else
+    shm_writer().publish(msg);  // mirror to shared memory (no-op until init)
+#endif
     simulizer::sync();
 }
 
@@ -790,6 +814,16 @@ void init() {
     if (!sampler_running.exchange(true)) {
         std::thread(sampler_loop).detach();
     }
+#ifndef SIMULIZER_ALONE
+    // Client-driven mode: mirror output into the shared-memory ring on the
+    // channel the launching client passed via env. No HTTP server, no browser.
+    {
+        const char* ch = std::getenv("SIMULIZER_SHM_CHANNEL");
+        shm_writer().init(ch && *ch ? std::string(ch)
+                                    : std::string(shm::DEFAULT_CHANNEL));
+    }
+#else
+    // Standalone mode: serve the web console over SSE and open a browser.
     svr.new_task_queue = [] {
         return new httplib::ThreadPool(8);
     };
@@ -834,8 +868,23 @@ void init() {
             }
         );
     });
-    openBrowser("http://localhost:8080/");
+    // Pick the first free port from 1000 so multiple standalone runs coexist.
+    int port = 1000;
+    for (; port < 65536; ++port)
+        if (svr.bind_to_port("localhost", port)) break;
+    server_port() = port;
+    openBrowser("http://localhost:" + std::to_string(port) + "/");
+#endif
     initailized = true;
+}
+
+// Run the standalone HTTP server (blocks until svr.stop()); a no-op in the
+// client-driven (shared-memory) build, so main() falls straight through to
+// joining the worker thread.
+inline void serve() {
+#ifdef SIMULIZER_ALONE
+    svr.listen_after_bind();
+#endif
 }
 }
 
