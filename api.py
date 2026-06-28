@@ -18,6 +18,7 @@ from routes.compile import router as compile_router
 from routes.lsp import router as lsp_router
 from routes.lsp import warm_clangd_pool, shutdown_clangd_pool, sweep_stale_sessions
 from routes.agent import router as agent_router
+from routes.macbuild import router as macbuild_router, capture_app_loop
 
 
 #asdf
@@ -43,6 +44,9 @@ async def lifespan(app: FastAPI):
     # sweep must run before warming, which creates fresh pool dirs.
     await sweep_stale_sessions()
     await warm_clangd_pool()
+    # Record the running loop so the (threadpool-run) build SSE can dispatch
+    # macOS jobs to a connected worker via run_coroutine_threadsafe.
+    capture_app_loop()
     yield
     await shutdown_clangd_pool()
 
@@ -63,6 +67,7 @@ app.add_middleware(
 app.include_router(compile_router)
 app.include_router(lsp_router)
 app.include_router(agent_router)
+app.include_router(macbuild_router)
 
 @app.head("/health")
 def health():

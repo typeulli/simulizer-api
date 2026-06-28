@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,13 @@ from pydantic import BaseModel
 
 from block2cpp import cppize
 from debug.instrument import instrument_tu
+from routes.macbuild import (
+    MacBuildError,
+    get_app_loop,
+    has_macbuild_worker,
+    run_mac_build_job,
+)
+from workers.macbuild import MacBuildFile, MacBuildRequest
 
 
 router = APIRouter(prefix="/compile")
@@ -52,7 +60,9 @@ _DEFINE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[A-Za-z0-9_.]+)?$')
 # the server parses these from the bundle's config.json (single source of truth)
 # rather than trusting client-sent values.
 class CompileOptions(BaseModel):
-    system: Optional[str] = None       # auto/None → sniff User-Agent (Build only)
+    # Per-OS build toggles (Build only). Empty dict → treat every OS as enabled.
+    # A `.sim` bundles one native binary per enabled+buildable OS.
+    systems: dict[str, bool] = {}
     optimization: str = "O3"
     std: str = "c++17"
     defines: list[str] = []
@@ -93,7 +103,6 @@ def _resolve_flags(opts: CompileOptions) -> ResolvedFlags:
 # (optimization/std/defines). Missing/invalid values fall back to defaults (the
 # editor surfaces JSON errors to the user separately). _resolve_flags then
 # re-validates as defense in depth before anything hits a command line.
-_SYSTEMS = {"auto", "windows", "linux", "macos"}
 CONFIG_FILENAME = "config.json"
 
 
@@ -130,8 +139,17 @@ def _compile_options_from_tree(tree: Optional[list]) -> CompileOptions:
     build = _section(cfg, "build")
     comp = _section(cfg, "compile")
     opts = CompileOptions()
-    if isinstance(build.get("system"), str) and build["system"] in _SYSTEMS:
-        opts.system = build["system"]
+    # `build.system` is an object of per-OS booleans (e.g. {"linux": false}); a
+    # missing OS / missing object defaults to enabled. We always resolve to a
+    # full dict so downstream code can read every OS.
+    systems = {os_key: True for os_key in OS_BUILD_ORDER}
+    sysval = build.get("system")
+    if isinstance(sysval, dict):
+        for os_key in OS_BUILD_ORDER:
+            v = sysval.get(os_key)
+            if isinstance(v, bool):
+                systems[os_key] = v
+    opts.systems = systems
     if isinstance(build.get("icon"), str):
         opts.icon = build["icon"].strip()
     if isinstance(build.get("alone"), bool):
@@ -184,6 +202,15 @@ def _stage_build_system(system_dir: Path):
 # For non-Windows targets the Win32 resource object and PDH/Winsock/GDI libs
 # are dropped (simstd.hpp gates those behind `_WIN32`) and the portable
 # embedded-asset data is recompiled from source inside the container.
+# Canonical OS order — also the order targets appear in a multi-OS .sim build.
+OS_BUILD_ORDER = ("windows", "linux", "macos")
+
+# This host builds Windows natively and Linux via Docker. macOS has no local
+# toolchain here; instead an off-box build worker (worker.py, run on a Mac)
+# connects over WebSocket and produces the macOS binary on demand. macOS is
+# therefore "buildable" only while such a worker is connected (see _buildable /
+# routes.macbuild). The osxcross docker recipe in _build_argv below is retained
+# but no longer exercised on this host.
 WINDOWS_GXX = "C:/mingw64/bin/g++.exe"
 WINDOWS_WINDRES = "C:/mingw64/bin/windres.exe"
 LINUX_BUILD_IMAGE = "gcc:13"
@@ -230,6 +257,16 @@ def _resolve_target_os(system: Optional[str], user_agent: str) -> str:
     if "linux" in ua or "android" in ua or "x11" in ua:
         return "linux"
     return "windows"
+
+
+def _buildable(os_key: str) -> bool:
+    """Whether this server can currently produce a binary for `os_key`. macOS is
+    built off-box by a connected build worker (worker.py) over WebSocket, so it's
+    buildable only while at least one such worker is connected; Windows and Linux
+    always build locally here."""
+    if os_key == "macos":
+        return has_macbuild_worker()
+    return os_key in TARGETS
 
 
 # Portable embedded-asset sources (pure byte arrays — no Win32 API). Windows
@@ -311,6 +348,58 @@ def _build_argv(os_key: str, *, cpp_file: Path, exe_file: Path, system_dir: Path
         image,
         *inner,
     ]
+
+
+# ── Off-box macOS build (worker) ───────────────────────────────────────────
+#
+# macOS has no local toolchain on this host. We ship the entire compile sandbox
+# (the materialized project tree + staged system headers + portable asset
+# sources) as a flat file list to a connected build worker, which reconstructs
+# it and runs the native clang++. All paths are made relative to out_dir so the
+# worker's `-I` layout matches ours (project/, _system/, _data/).
+
+_MACOS_NO_WORKER_DETAIL = (
+    "macOS 빌드 서버(worker)가 연결되어 있지 않습니다. macOS를 빌드하려면 빌드 worker를 "
+    "연결하거나, config.json 의 build.system 에서 macOS를 꺼주세요."
+)
+
+
+def _collect_build_inputs(out_dir: Path, dirs: list[Path]) -> list[MacBuildFile]:
+    """Base64-pack every file under each of `dirs` (which all live beneath
+    out_dir) into MacBuildFile entries keyed by their out_dir-relative path."""
+    files: list[MacBuildFile] = []
+    for d in dirs:
+        if not d.exists():
+            continue
+        for p in sorted(d.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(out_dir).as_posix()
+            files.append(MacBuildFile(
+                path=rel,
+                content_b64=base64.b64encode(p.read_bytes()).decode("ascii"),
+            ))
+    return files
+
+
+def _build_macbuild_request(out_dir: Path, cpp_file: Path, system_dir: Path,
+                            project_root: Path, data_cpp: Path,
+                            flags: ResolvedFlags, out_name: str) -> MacBuildRequest:
+    """Assemble the payload a build worker needs to compile the user's program
+    for macOS. `data_cpp` is required (non-Windows targets recompile the
+    portable embedded-asset data from source)."""
+    files = _collect_build_inputs(out_dir, [project_root, system_dir, data_cpp.parent])
+    return MacBuildRequest(
+        files=files,
+        entry_rel=cpp_file.relative_to(out_dir).as_posix(),
+        system_rel=system_dir.relative_to(out_dir).as_posix(),
+        project_rel=project_root.relative_to(out_dir).as_posix(),
+        data_cpp_rel=data_cpp.relative_to(out_dir).as_posix(),
+        out_name=out_name,
+        std_flag=flags.std_flag,
+        opt_flag=flags.opt_flag,
+        define_flags=list(flags.define_flags),
+    )
 
 
 # ── Windows exe icon ───────────────────────────────────────────────────────
@@ -622,6 +711,28 @@ def _stream_build(file_uuid: str, out_dir: Path, cpp_file: Path, exe_file: Path,
                   project_root: Path, system_dir: Path, target: BuildTarget,
                   data_cpp: Optional[Path], flags: ResolvedFlags,
                   res_override: Optional[Path] = None):
+    # macOS is built off-box by a connected worker (no local toolchain). Drive
+    # the remote build, mapping its progress reports onto our SSE step counter;
+    # the bridge writes the returned binary to exe_file on success.
+    if target.key == "macos":
+        assert data_cpp is not None, "macOS build needs the staged data source"
+        yield f"data: {json.dumps({'uuid': file_uuid, 'step': 0, 'total': BUILD_TOTAL, 'message': '빌드 준비'})}\n\n"
+        req = _build_macbuild_request(out_dir, cpp_file, system_dir, project_root,
+                                      data_cpp, flags, out_name=target.out_name)
+        step = 0
+        try:
+            for msg in run_mac_build_job(req, exe_file, loop=get_app_loop()):
+                step = min(step + 1, BUILD_TOTAL - 1)
+                yield f"data: {json.dumps({'step': step, 'total': BUILD_TOTAL, 'message': msg})}\n\n"
+        except MacBuildError as e:
+            _write_status(out_dir, "error", detail=e.detail)
+            yield f"event: error\ndata: {json.dumps({'detail': e.detail})}\n\n"
+            return
+        _write_status(out_dir, "ready", out_name=target.out_name, download_name=target.download_name)
+        yield f"data: {json.dumps({'step': BUILD_TOTAL, 'total': BUILD_TOTAL, 'message': '완료'})}\n\n"
+        yield f"event: done\ndata: {json.dumps({'uuid': file_uuid, 'name': target.download_name})}\n\n"
+        return
+
     # The -I paths are restricted to per-build staging dirs so user code cannot
     # reach backend Python sources, the auth `key/` dir, prompts, etc. via
     # #include. Only the headers in _BUILD_SYSTEM_FILES land in system_dir.
@@ -687,6 +798,98 @@ int main() {
 """
 
 
+def _stream_build_multi(file_uuid: str, out_dir: Path, cpp_file: Path,
+                        project_root: Path, system_dir: Path,
+                        data_cpp: Optional[Path], flags: ResolvedFlags,
+                        jobs: list[dict], skipped: list[str]):
+    """Build the user's program once per target OS and zip the binaries into a
+    single `output.sim`. simulizerv unpacks only the entry for the OS it runs on
+    (arcnames are `<os>/<binary>`). Progress is streamed across all jobs; a
+    single OS failing aborts the whole bundle."""
+    total = max(1, len(jobs) * BUILD_TOTAL)
+    yield f"data: {json.dumps({'uuid': file_uuid, 'step': 0, 'total': total, 'message': '빌드 준비'})}\n\n"
+    if skipped:
+        names = ", ".join(skipped)
+        yield f"data: {json.dumps({'step': 0, 'total': total, 'message': f'{names} 빌드는 이 서버에서 지원되지 않아 건너뜁니다 (전용 빌드 서버 연결 시 포함됩니다).'})}\n\n"
+
+    for i, job in enumerate(jobs):
+        os_key = job["os"]
+        base = i * BUILD_TOTAL
+
+        # macOS is built off-box by a connected worker; everything else builds
+        # locally below. The bridge writes the returned binary to job["exe_file"]
+        # so the .sim packaging step downstream is identical.
+        if os_key == "macos":
+            assert data_cpp is not None, "macOS build needs the staged data source"
+            yield f"data: {json.dumps({'step': base, 'total': total, 'message': '[macos] 빌드 시작'})}\n\n"
+            req = _build_macbuild_request(out_dir, cpp_file, system_dir, project_root,
+                                          data_cpp, flags, out_name=TARGETS['macos'].out_name)
+            step = 0
+            try:
+                for msg in run_mac_build_job(req, job["exe_file"], loop=get_app_loop()):
+                    step = min(step + 1, BUILD_TOTAL - 1)
+                    yield f"data: {json.dumps({'step': base + step, 'total': total, 'message': f'[macos] {msg}'})}\n\n"
+            except MacBuildError as e:
+                _write_status(out_dir, "error", detail=e.detail)
+                yield f"event: error\ndata: {json.dumps({'detail': e.detail})}\n\n"
+                return
+            yield f"data: {json.dumps({'step': base + BUILD_TOTAL, 'total': total, 'message': '[macos] 완료'})}\n\n"
+            continue
+
+        # -I paths stay restricted to the per-build staging dirs (system_dir /
+        # project_root) so user code can't #include backend sources.
+        command = _build_argv(
+            os_key,
+            cpp_file=cpp_file,
+            exe_file=job["exe_file"],
+            system_dir=system_dir,
+            project_root=project_root,
+            out_dir=out_dir,
+            data_cpp=data_cpp,
+            flags=flags,
+            res_override=job["res_override"],
+        )
+
+        yield f"data: {json.dumps({'step': base, 'total': total, 'message': f'[{os_key}] 빌드 시작'})}\n\n"
+
+        proc = subprocess.Popen(command, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+        step = 0
+        stderr_buf: list[str] = []
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_buf.append(line)
+            for idx, (pattern, msg) in enumerate(BUILD_STAGES, start=1):
+                if idx > step and pattern.search(line):
+                    step = idx
+                    yield f"data: {json.dumps({'step': base + step, 'total': total, 'message': f'[{os_key}] {msg}'})}\n\n"
+                    break
+        proc.wait()
+        if proc.returncode != 0:
+            stderr_text = f"[{os_key}] 빌드 실패\n" + "".join(stderr_buf)
+            _write_status(out_dir, "error", detail=stderr_text)
+            yield f"event: error\ndata: {json.dumps({'detail': stderr_text})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'step': base + BUILD_TOTAL, 'total': total, 'message': f'[{os_key}] 완료'})}\n\n"
+
+    # Bundle every produced binary into output.sim (a zip; simulizerv reads it).
+    sim_path = out_dir / "output.sim"
+    try:
+        with zipfile.ZipFile(sim_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for job in jobs:
+                zf.write(job["exe_file"], arcname=job["arcname"])
+    except Exception as e:
+        detail = f".sim 패키징 실패: {e}"
+        _write_status(out_dir, "error", detail=detail)
+        yield f"event: error\ndata: {json.dumps({'detail': detail})}\n\n"
+        return
+
+    _write_status(out_dir, "ready", out_name="output.sim", download_name="output.sim",
+                  systems=[job["os"] for job in jobs])
+    yield f"data: {json.dumps({'step': total, 'total': total, 'message': '완료'})}\n\n"
+    yield f"event: done\ndata: {json.dumps({'uuid': file_uuid, 'name': 'output.sim'})}\n\n"
+
+
 @router.post("/build")
 def build(body: BuildRequest, request: Request, system: Optional[str] = None):
     # Resolve compile options from the bundle's config.json (server-side source
@@ -694,19 +897,6 @@ def build(body: BuildRequest, request: Request, system: Optional[str] = None):
     # the command line.
     opts = _compile_options_from_tree(body.tree)
     flags = _resolve_flags(opts)
-
-    # Build for the requesting client's OS. Precedence: explicit `?system=`
-    # query → config.json `system` → User-Agent sniff. "auto"/None means sniff.
-    requested_system = system
-    if not requested_system and opts.system and opts.system != "auto":
-        requested_system = opts.system
-    os_key = _resolve_target_os(requested_system, request.headers.get("user-agent", ""))
-    target = TARGETS[os_key]
-    if not opts.alone:
-        # Client-driven build: ship as output.sim — a renamed native executable
-        # the Simulizer desktop client launches as a subprocess and reads over
-        # shared memory. The on-disk out_name (what `-o` produced) is unchanged.
-        target = BuildTarget(target.key, target.out_name, "output.sim")
 
     file_uuid = str(uuid.uuid4())
     out_dir = path_temp / file_uuid
@@ -718,20 +908,13 @@ def build(body: BuildRequest, request: Request, system: Optional[str] = None):
     # cpp bundle pathway we materialize the whole tree and append the main
     # shim to a copy of the entry file. Either way the build command sees
     # `output.cpp` as the translation unit and -I<project_root> resolves
-    # `#include "..."`s for sibling/nested headers.
+    # `#include "..."`s for sibling/nested headers. The source is OS-independent,
+    # so it's materialized once and reused across every target OS.
     project_root = out_dir / "project"
     project_root.mkdir(parents=True, exist_ok=True)
     system_dir = out_dir / "_system"
     system_dir.mkdir(parents=True, exist_ok=True)
     _stage_build_system(system_dir)
-
-    # Windows links the prebuilt bin/binary_data.o; non-Windows targets compile
-    # the portable asset data from source inside the build container.
-    data_cpp = None
-    if os_key != "windows":
-        data_dir = out_dir / "_data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        data_cpp = _stage_build_data(data_dir)
 
     if body.lang == "blocks":
         if not body.code:
@@ -741,6 +924,8 @@ def build(body: BuildRequest, request: Request, system: Optional[str] = None):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         full_source = '#include <iostream>\n' + cpp_code + _MAIN_SHIM
+        cpp_file = project_root / "output.cpp"
+        cpp_file.write_text(full_source, encoding="utf-8")
     elif body.lang == "cpp":
         if not isinstance(body.tree, list) or not body.entry:
             raise HTTPException(status_code=400, detail="tree and entry are required for cpp build")
@@ -751,29 +936,95 @@ def build(body: BuildRequest, request: Request, system: Optional[str] = None):
         # Overwrite the entry file with the wrapped source so include search
         # paths and relative includes still resolve from its original location.
         entry_path.write_text(full_source, encoding="utf-8")
+        cpp_file = entry_path
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported lang: {body.lang}")
 
-    if body.lang == "blocks":
-        cpp_file = project_root / "output.cpp"
-        cpp_file.write_text(full_source, encoding="utf-8")
-    else:
-        cpp_file = entry_path
-    exe_file = out_dir / target.out_name
+    sse_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
-    # Custom exe icon: resolve the relative compile.icon path within the tree to
-    # .ico bytes (traversal-safe), then embed it. Only Windows links a Win32
-    # resource, so the icon is applied there and ignored for Linux/macOS.
-    res_override: Optional[Path] = None
-    if os_key == "windows":
+    # ── Standalone (build.alone): one directly-runnable executable for the
+    #    requesting OS (SSE console + browser). Not a .sim, so it isn't bundled.
+    if opts.alone:
+        os_key = _resolve_target_os(system, request.headers.get("user-agent", ""))
+        if not _buildable(os_key):
+            if os_key == "macos":
+                raise HTTPException(status_code=503, detail=_MACOS_NO_WORKER_DETAIL)
+            raise HTTPException(status_code=400, detail=f"이 서버에서는 {os_key} 빌드를 지원하지 않습니다.")
+        target = TARGETS[os_key]
+        data_cpp = None
+        if os_key != "windows":
+            data_dir = out_dir / "_data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            data_cpp = _stage_build_data(data_dir)
+        exe_file = out_dir / target.out_name
+        res_override: Optional[Path] = None
+        if os_key == "windows":
+            icon_bytes = _resolve_icon_from_tree(body.tree, opts.icon)
+            if icon_bytes:
+                res_override = _build_windows_resource(out_dir, icon_bytes)
+        return StreamingResponse(
+            _stream_build(file_uuid, out_dir, cpp_file, exe_file, project_root, system_dir, target, data_cpp, flags, res_override),
+            media_type="text/event-stream", headers=sse_headers,
+        )
+
+    # ── Client-driven (.sim): build a native binary per enabled OS and zip them
+    #    into one output.sim. An explicit `?system=` query forces a single OS;
+    #    otherwise the enabled set comes from config.json `build.system`
+    #    (every OS defaults on). A requested macOS target requires a connected
+    #    build worker — without one the whole build fails (see below).
+    if system:
+        key = _SYSTEM_ALIASES.get(system.strip().lower())
+        if key is None:
+            raise HTTPException(status_code=400, detail=f"Unsupported system: {system!r}")
+        requested = [key]
+    else:
+        requested = [os_key for os_key in OS_BUILD_ORDER if opts.systems.get(os_key, True)]
+
+    # A macOS target requires a connected build worker. If one is requested but
+    # none is connected, fail the whole build (rather than silently dropping
+    # macOS) so the user knows the bundle would be incomplete.
+    if "macos" in requested and not _buildable("macos"):
+        raise HTTPException(status_code=503, detail=_MACOS_NO_WORKER_DETAIL)
+
+    build_list = [os_key for os_key in requested if _buildable(os_key)]
+    skipped = [os_key for os_key in requested if not _buildable(os_key)]
+    if not build_list:
+        raise HTTPException(
+            status_code=400,
+            detail="빌드할 대상 OS가 없습니다. config.json 의 build.system 에서 최소 하나의 OS를 켜주세요 "
+                   "(이 서버에서는 macOS 빌드를 아직 지원하지 않습니다).",
+        )
+
+    # Non-Windows targets recompile the portable asset data from source inside
+    # their container; stage it once and share it across them.
+    data_cpp = None
+    if any(os_key != "windows" for os_key in build_list):
+        data_dir = out_dir / "_data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        data_cpp = _stage_build_data(data_dir)
+
+    # Custom exe icon — Windows-only (only Windows links a Win32 resource).
+    res_override = None
+    if "windows" in build_list:
         icon_bytes = _resolve_icon_from_tree(body.tree, opts.icon)
         if icon_bytes:
             res_override = _build_windows_resource(out_dir, icon_bytes)
 
+    jobs: list[dict] = []
+    for os_key in build_list:
+        target = TARGETS[os_key]
+        build_dir = out_dir / f"build_{os_key}"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        jobs.append({
+            "os": os_key,
+            "exe_file": build_dir / target.out_name,
+            "arcname": f"{os_key}/{target.out_name}",
+            "res_override": res_override if os_key == "windows" else None,
+        })
+
     return StreamingResponse(
-        _stream_build(file_uuid, out_dir, cpp_file, exe_file, project_root, system_dir, target, data_cpp, flags, res_override),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        _stream_build_multi(file_uuid, out_dir, cpp_file, project_root, system_dir, data_cpp, flags, jobs, skipped),
+        media_type="text/event-stream", headers=sse_headers,
     )
 
 
