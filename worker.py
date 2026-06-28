@@ -64,6 +64,11 @@ def _build_argv(req: MacBuildRequest, build_dir: Path, exe: Path) -> list[str]:
         req.opt_flag,
         *req.define_flags,
         "-pthread",
+        # GCC (the Windows/Linux targets) treats narrowing inside a braced
+        # init list as a *warning*, but Apple clang makes -Wc++11-narrowing a
+        # hard error by default. Demote it so a .sim that compiles for
+        # Windows/Linux also compiles for macOS from the same source.
+        "-Wno-c++11-narrowing",
         "-v",
     ]
 
