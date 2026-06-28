@@ -37,6 +37,10 @@ def run_cmd(cmd: list[str]):
 
 def make_bin_dir():
     (path_here / "bin").mkdir(exist_ok=True)
+    # lib/bin/ holds the embedded-asset outputs (index.html.hpp, console.html.hpp,
+    # binary_data.cpp). It's gitignored (**/bin/*), so a fresh clone won't have the
+    # directory — create it so the embed/compile steps below can write into it.
+    (path_here / "lib" / "bin").mkdir(parents=True, exist_ok=True)
 
 
 def write_binary_data_cpp():
@@ -111,6 +115,8 @@ steps = [
         "res/index.html", "lib/bin/index.html.hpp", "_binary_assets_index_html")),
     ("console.html 임베드", lambda: embed_as_hpp(
         "res/console.html", "lib/bin/console.html.hpp", "_binary_assets_console_html")),
+    ("console.js 임베드", lambda: embed_as_hpp(
+        "res/console.js", "lib/bin/console.hpp", "_binary_assets_console_js")),
     ("binary_data.cpp 생성", write_binary_data_cpp),
     ("binary_data.o 컴파일 (g++)", compile_binary_data),
     ("runtime 모듈 빌드 (em++)", build_emcc_runtime),
