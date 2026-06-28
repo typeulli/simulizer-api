@@ -1,0 +1,19 @@
+# Simulizer API backend — Python dependencies.
+# Regenerated from the actual imports across api.py / build.py / routes / workers / debug.
+# Native toolchains (LLVM, MinGW g++, Emscripten) used by build.py are NOT pip packages
+# and must be installed separately on the build host.
+
+fastapi
+uvicorn[standard]
+pydantic
+groq
+httpx
+websockets
+Pillow
+
+# build.py: progress UI
+rich
+
+# strip_simstd.py / debug/instrument.py — provides the `clang.cindex` bindings.
+# The bundled libclang is overridden at runtime to the system LLVM 20 install.
+libclang
